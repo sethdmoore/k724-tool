@@ -4,9 +4,17 @@
 Protocol confirmed by a live usbmon capture (see RE_STATUS.md, session 3):
 a 64-byte interrupt-OUT HID report, command ID 0x06, sent as 3 chunks.
 
-The default target is the wired keyboard (vid=0x320f pid=0x511b). Use
---wireless to target the 2.4 GHz receiver (vid=0x320f pid=0x511c) instead.
---vid and --pid override both defaults.
+WARNING: this protocol was captured over the 2.4 GHz wireless receiver
+only. A run against the wired keyboard is known to force every key's RGB
+to solid white, with no onboard-control recovery (full power cycle
+needed). The wired connection likely does not accept these bytes
+verbatim -- do not use --wired until this is root-caused with a wired
+capture.
+
+The default target is the wireless receiver (vid=0x320f pid=0x511c),
+the only connection confirmed safe. Pass --wired to target the wired
+keyboard (vid=0x320f pid=0x511b) instead, at your own risk. --vid and
+--pid override both defaults.
 
 Requires: pip install hidapi
 """
@@ -17,12 +25,13 @@ import time
 
 TEST_TIME = datetime.datetime(2000, 1, 1, 23, 59, 59).timetuple()
 
-# Wired keyboard identity ("REDRAGON Gaming KB"). This is the default target.
+# Wired keyboard identity ("REDRAGON Gaming KB"). NOT confirmed safe --
+# select it only with --wired. See the WARNING above.
 WIRED_VID = 0x320F
 WIRED_PID = 0x511B
 
 # 2.4 GHz wireless receiver identity ("REDRAGON 2.4G Wireless Receiver").
-# Select it with --wireless.
+# The only confirmed-safe target, and the default.
 WIRELESS_VID = 0x320F
 WIRELESS_PID = 0x511C
 
@@ -164,12 +173,14 @@ def main():
     )
     parser.add_argument("--path", type=str, default=None, help="exact hidapi device path")
     parser.add_argument(
-        "--wireless",
+        "--wired",
         action="store_true",
         help=(
-            "target the 2.4 GHz wireless receiver "
-            f"(vid=0x{WIRELESS_VID:04x} pid=0x{WIRELESS_PID:04x}) instead of the "
-            f"wired keyboard (vid=0x{WIRED_VID:04x} pid=0x{WIRED_PID:04x})"
+            "target the wired keyboard "
+            f"(vid=0x{WIRED_VID:04x} pid=0x{WIRED_PID:04x}) instead of the "
+            f"wireless receiver (vid=0x{WIRELESS_VID:04x} pid=0x{WIRELESS_PID:04x}). "
+            "NOT confirmed safe -- known to force all-key RGB to solid white "
+            "on at least one keyboard, recoverable only by a full power cycle."
         ),
     )
     parser.add_argument("--list", action="store_true", help="list candidate HID interfaces and exit")
@@ -182,14 +193,6 @@ def main():
     args = parser.parse_args()
     when = TEST_TIME if args.test else None
 
-    # Pick the target device identity. --vid/--pid are explicit overrides and
-    # take priority over --wireless and the wired default.
-    if args.vid is None and args.pid is None and not args.path:
-        if args.wireless:
-            args.vid, args.pid = WIRELESS_VID, WIRELESS_PID
-        else:
-            args.vid, args.pid = WIRED_VID, WIRED_PID
-
     if args.list:
         for info in find_candidates():
             print(
@@ -198,6 +201,23 @@ def main():
                 f"interface={info.get('interface_number')} usage_page=0x{info.get('usage_page', 0):04x}"
             )
         return
+
+    # Pick the target device identity. --vid/--pid are explicit overrides and
+    # take priority over --wired and the wireless default.
+    if args.vid is None and args.pid is None and not args.path:
+        if args.wired:
+            if not args.dry_run:
+                print(
+                    "WARNING: --wired is not confirmed safe. This protocol was "
+                    "captured over the wireless receiver only, and a wired run has "
+                    "previously forced all-key RGB to solid white, recoverable only "
+                    "by a full power cycle. Proceeding in 3 seconds -- Ctrl-C to abort.",
+                    file=sys.stderr,
+                )
+                time.sleep(3)
+            args.vid, args.pid = WIRED_VID, WIRED_PID
+        else:
+            args.vid, args.pid = WIRELESS_VID, WIRELESS_PID
 
     if args.dry_run:
         payload = clock_payload(when)

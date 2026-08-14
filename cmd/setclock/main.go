@@ -1,5 +1,11 @@
 // Command setclock sets the onboard clock of a Redragon K724-RGB-PRO
 // keyboard from the local time.
+//
+// WARNING: this protocol was captured over the 2.4 GHz wireless receiver
+// only. A run against the wired keyboard is known to force every key's
+// RGB to solid white, with no onboard-control recovery (full power cycle
+// needed). Do not pass -wired until this is root-caused with a wired
+// capture. The default target is the wireless receiver.
 package main
 
 import (
@@ -29,18 +35,21 @@ func main() {
 func run(args []string) error {
 	fs := flag.NewFlagSet("setclock", flag.ContinueOnError)
 	var (
-		vidFlag  string
-		pidFlag  string
-		path     string
-		wireless bool
-		list     bool
-		dryRun   bool
-		test     bool
+		vidFlag string
+		pidFlag string
+		path    string
+		wired   bool
+		list    bool
+		dryRun  bool
+		test    bool
 	)
 	fs.StringVar(&vidFlag, "vid", "", "USB vendor ID override, for example 0x320f")
 	fs.StringVar(&pidFlag, "pid", "", "USB product ID override, for example 0x511b")
 	fs.StringVar(&path, "path", "", "exact hidapi device path")
-	fs.BoolVar(&wireless, "wireless", false, "target the 2.4 GHz wireless receiver instead of the wired keyboard")
+	fs.BoolVar(&wired, "wired", false,
+		"target the wired keyboard instead of the wireless receiver. "+
+			"NOT confirmed safe -- known to force all-key RGB to solid white "+
+			"on at least one keyboard, recoverable only by a full power cycle.")
 	fs.BoolVar(&list, "list", false, "list candidate HID interfaces and exit")
 	fs.BoolVar(&dryRun, "dry-run", false, "print the reports without opening a device")
 	fs.BoolVar(&test, "test", false, "set an obviously fake time (2000-01-01 23:59:59) to confirm the write took effect")
@@ -65,9 +74,15 @@ func run(args []string) error {
 	}
 
 	vid := uint16(protocol.VendorID)
-	pid := uint16(protocol.ProductIDWired)
-	if wireless {
-		pid = protocol.ProductIDWireless
+	pid := uint16(protocol.ProductIDWireless)
+	if wired {
+		fmt.Fprintln(os.Stderr,
+			"WARNING: -wired is not confirmed safe. This protocol was captured "+
+				"over the wireless receiver only, and a wired run has previously "+
+				"forced all-key RGB to solid white, recoverable only by a full "+
+				"power cycle. Proceeding in 3 seconds -- Ctrl-C to abort.")
+		time.Sleep(3 * time.Second)
+		pid = protocol.ProductIDWired
 	}
 	if vidFlag != "" {
 		v, err := parseHexUint16(vidFlag)

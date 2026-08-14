@@ -160,9 +160,20 @@ This closed three open questions left by static analysis alone:
   value, not the ambiguous ATL `CTime` "+1 then -1" encoding that the
   decompiled source suggested.
 
-## Known-good client
+## Known-good client — wireless only
 
-`python/set_clock.py` (`hidapi`-based) implements this protocol and is
-confirmed working against real hardware: the device echoed every write
-correctly, and the `0xAA` ping successfully auto-selected the correct
-HID interface out of several candidates for the same VID/PID.
+`python/set_clock.py` and `cmd/setclock` (both `hidapi`-based)
+implement this protocol and are confirmed working **against the 2.4
+GHz wireless receiver**: the device echoed every write correctly, and
+the `0xAA` ping successfully auto-selected the correct HID interface
+out of several candidates for the same VID/PID.
+
+**The wired keyboard is a different story.** Sending this exact,
+wireless-captured payload to the wired connection forced every key's
+RGB to solid white, recoverable only by a full power cycle — not by
+the onboard controls. Both clients default to the wireless receiver
+and require an explicit opt-in flag (with a warning) to target the
+wired keyboard. Treat the wired connection as unverified until a live
+capture of the real Windows app talking to the keyboard over a wired
+connection confirms whether this payload needs to differ. See the
+README's "Known issue" section.
