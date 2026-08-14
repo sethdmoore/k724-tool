@@ -15,7 +15,15 @@ Device identity (confirmed with `lsusb`):
 - `cmd/setclock/` — a Go port, `internal/protocol/` — the shared wire
   protocol code.
 - `docs/` — the full protocol write-up, from a live USB capture and
-  static analysis of the Windows app (`Ghidra`, `strings`).
+  static analysis of the Windows app (`Ghidra`, `strings`):
+  - [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — the 64-byte report
+    framing and the confirmed clock command. Start here.
+  - [`docs/COMMANDS.md`](docs/COMMANDS.md) — every known command ID,
+    with a confirmed/hypothesis/unknown label for each.
+  - [`docs/RGB_LIGHTING.md`](docs/RGB_LIGHTING.md) — the per-key
+    lighting report format and the app's effect-mode names.
+  - [`docs/SCREEN.md`](docs/SCREEN.md) — the TFT screen frame format
+    and the state of the frame-upload investigation.
 
 ## Status
 
