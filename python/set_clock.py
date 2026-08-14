@@ -4,6 +4,10 @@
 Protocol confirmed by a live usbmon capture (see RE_STATUS.md, session 3):
 a 64-byte interrupt-OUT HID report, command ID 0x06, sent as 3 chunks.
 
+The default target is the wired keyboard (vid=0x320f pid=0x511b). Use
+--wireless to target the 2.4 GHz receiver (vid=0x320f pid=0x511c) instead.
+--vid and --pid override both defaults.
+
 Requires: pip install hidapi
 """
 import argparse
@@ -12,6 +16,15 @@ import sys
 import time
 
 TEST_TIME = datetime.datetime(2000, 1, 1, 23, 59, 59).timetuple()
+
+# Wired keyboard identity ("REDRAGON Gaming KB"). This is the default target.
+WIRED_VID = 0x320F
+WIRED_PID = 0x511B
+
+# 2.4 GHz wireless receiver identity ("REDRAGON 2.4G Wireless Receiver").
+# Select it with --wireless.
+WIRELESS_VID = 0x320F
+WIRELESS_PID = 0x511C
 
 TEMPLATE_PREFIX = bytes.fromhex(
     "000503020001cccccc06000000b400ff00ff0000ff00000000000000000000ff00000a"
@@ -134,10 +147,31 @@ def set_clock(dev, when=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--vid", type=lambda s: int(s, 0), default=None)
-    parser.add_argument("--pid", type=lambda s: int(s, 0), default=None)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--vid",
+        type=lambda s: int(s, 0),
+        default=None,
+        help="override the vendor ID (takes priority over the default and --wireless)",
+    )
+    parser.add_argument(
+        "--pid",
+        type=lambda s: int(s, 0),
+        default=None,
+        help="override the product ID (takes priority over the default and --wireless)",
+    )
     parser.add_argument("--path", type=str, default=None, help="exact hidapi device path")
+    parser.add_argument(
+        "--wireless",
+        action="store_true",
+        help=(
+            "target the 2.4 GHz wireless receiver "
+            f"(vid=0x{WIRELESS_VID:04x} pid=0x{WIRELESS_PID:04x}) instead of the "
+            f"wired keyboard (vid=0x{WIRED_VID:04x} pid=0x{WIRED_PID:04x})"
+        ),
+    )
     parser.add_argument("--list", action="store_true", help="list candidate HID interfaces and exit")
     parser.add_argument("--dry-run", action="store_true", help="print the reports without opening a device")
     parser.add_argument(
@@ -147,6 +181,14 @@ def main():
     )
     args = parser.parse_args()
     when = TEST_TIME if args.test else None
+
+    # Pick the target device identity. --vid/--pid are explicit overrides and
+    # take priority over --wireless and the wired default.
+    if args.vid is None and args.pid is None and not args.path:
+        if args.wireless:
+            args.vid, args.pid = WIRELESS_VID, WIRELESS_PID
+        else:
+            args.vid, args.pid = WIRED_VID, WIRED_PID
 
     if args.list:
         for info in find_candidates():
