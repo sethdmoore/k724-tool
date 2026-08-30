@@ -113,6 +113,14 @@ func (a *App) buildLightingTab() fyne.CanvasObject {
 	speedVal := widget.NewLabel("0")
 	speed.OnChanged = func(v float64) { speedVal.SetText(fmt.Sprintf("%d", int(v))) }
 
+	// The device's raw speed byte is actually more like a delay/period: a
+	// larger raw value animates *slower*. The slider is meant to read
+	// "right = faster" (matching the Brightness slider's low-left/high-right
+	// feel), so invert between the slider's displayed value and the raw
+	// byte written to / read from the device. Self-inverse, so the same
+	// helper works both directions.
+	invSpeed := func(v int) int { return 5 - v }
+
 	current := color.NRGBA{A: 0xff}
 	swatch := canvas.NewRectangle(current)
 	swatch.SetMinSize(fyne.NewSize(48, 24))
@@ -127,7 +135,7 @@ func (a *App) buildLightingTab() fyne.CanvasObject {
 
 	apply := widget.NewButton("Apply changes", func() {
 		wantEffect, okEffect := effectIDForName(effect.Selected)
-		wantBr, wantSp := int(brightness.Value), int(speed.Value)
+		wantBr, wantSp := int(brightness.Value), invSpeed(int(speed.Value))
 		col, picked := current, colorPicked
 		applog.Infof("lighting apply: want effect=%q(%d ok=%v) brightness=%d speed=%d colourPicked=%v(%02x%02x%02x)",
 			effect.Selected, wantEffect, okEffect, wantBr, wantSp, picked, col.R, col.G, col.B)
@@ -180,7 +188,7 @@ func (a *App) buildLightingTab() fyne.CanvasObject {
 			effect.ClearSelected()
 		}
 		brightness.SetValue(float64(b.Brightness()))
-		speed.SetValue(float64(b.Speed()))
+		speed.SetValue(float64(invSpeed(b.Speed())))
 		r, g, bl := b.Color()
 		current = color.NRGBA{R: r, G: g, B: bl, A: 0xff}
 		swatch.FillColor = current
