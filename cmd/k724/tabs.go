@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/color"
 	"io"
+	"math"
 	"path/filepath"
 	"runtime/debug"
 	"strconv"
@@ -370,6 +371,170 @@ type frameItem struct {
 
 const maxFrames = 25
 
+// frameCard is one thumbnail card on the Screen tab's timeline. It implements
+// fyne.Draggable so a frame can be dragged left/right to reorder it among its
+// siblings, or dragged onto the trash drop zone (trashArea) to remove it —
+// see the onDrag closure built in buildScreenTab's rebuildList, which owns
+// the frames/trash slices and decides what a given gesture meant. frameCard
+// itself just reports the gesture; it holds no frame-list state of its own.
+//
+// While a drag is in progress, frameCard also pushes a lightweight "ghost"
+// copy of itself onto the window's canvas overlay stack (hostCanvas) so it
+// always paints above every sibling card — container.NewHBox paints strictly
+// in Objects() order, which never changes mid-drag, so without an overlay a
+// card dragged toward a higher-index sibling would render underneath it.
+type frameCard struct {
+	widget.BaseWidget
+	body fyne.CanvasObject
+
+	// hostCanvas, thumb and frameNum are only used to build and place the
+	// drag ghost (see buildGhost/Dragged). hostCanvas may be nil, in which
+	// case dragging falls back to the plain Move()-only behaviour.
+	hostCanvas fyne.Canvas
+	thumb      image.Image // same pixels as the card's thumbnail
+	frameNum   int         // 1-based position, shown on the card and its ghost
+
+	// onDrag, if set, fires once per drag gesture (at DragEnd) with the
+	// total delta accumulated since the drag started and the pointer's
+	// final absolute (screen) position.
+	onDrag func(dx, dy float32, absPos fyne.Position)
+	// onDragMove, if set, fires on every Dragged event (including the first
+	// of a gesture) with the pointer's current absolute position — used to
+	// drive the trash-drop-zone highlight.
+	onDragMove func(absPos fyne.Position)
+	// onTap, if set, fires for a plain click (no drag) on the card body.
+	onTap func()
+
+	dragging bool
+	origPos  fyne.Position
+	dx, dy   float32
+	lastAbs  fyne.Position
+
+	ghost       fyne.CanvasObject
+	ghostOrigin fyne.Position
+}
+
+func newFrameCard(body fyne.CanvasObject, hostCanvas fyne.Canvas, thumb image.Image, frameNum int,
+	onDragMove func(absPos fyne.Position), onDrag func(dx, dy float32, absPos fyne.Position), onTap func()) *frameCard {
+	c := &frameCard{
+		body:       body,
+		hostCanvas: hostCanvas,
+		thumb:      thumb,
+		frameNum:   frameNum,
+		onDragMove: onDragMove,
+		onDrag:     onDrag,
+		onTap:      onTap,
+	}
+	c.ExtendBaseWidget(c)
+	return c
+}
+
+func (c *frameCard) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(c.body)
+}
+
+// Tapped implements fyne.Tappable.
+func (c *frameCard) Tapped(*fyne.PointEvent) {
+	if c.onTap != nil {
+		c.onTap()
+	}
+}
+
+// buildGhost builds a small detached copy of the card's visual (same
+// thumbnail pixels, same frame-number label) for the drag overlay. It's a
+// fresh CanvasObject rather than a reference to c.body because a CanvasObject
+// can only belong to one place in the render tree at a time — c.body stays
+// put in listBox for the whole drag.
+func (c *frameCard) buildGhost() fyne.CanvasObject {
+	gi := canvas.NewImageFromImage(c.thumb)
+	gi.FillMode = canvas.ImageFillContain
+	gi.ScaleMode = canvas.ImageScalePixels
+	gi.SetMinSize(fyne.NewSize(72, 40))
+	return container.NewVBox(
+		widget.NewLabelWithStyle(fmt.Sprintf("%d", c.frameNum), fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+		gi,
+	)
+}
+
+// Dragged implements fyne.Draggable. It nudges the card's own position for
+// visual feedback as the pointer moves and accumulates the gesture's total
+// delta; the timeline is rebuilt from scratch at DragEnd (via onDrag calling
+// rebuildList), which snaps every card back to its laid-out position.
+//
+// On the first event of a gesture it also raises a ghost copy onto the
+// canvas overlay stack — Fyne's mechanism for guaranteeing something paints
+// above the whole window content, the same one dialogs/menus use — and keeps
+// it positioned in lockstep with the card's own (locally-computed) movement,
+// translated into absolute canvas coordinates via ghostOrigin.
+func (c *frameCard) Dragged(ev *fyne.DragEvent) {
+	if !c.dragging {
+		c.dragging = true
+		c.origPos = c.Position()
+		c.dx, c.dy = 0, 0
+		if c.hostCanvas != nil {
+			c.ghost = c.buildGhost()
+			c.hostCanvas.Overlays().Add(c.ghost)
+			c.ghost.Resize(c.Size())
+			c.ghostOrigin = fyne.CurrentApp().Driver().AbsolutePositionForObject(c)
+			c.ghost.Move(c.ghostOrigin)
+		}
+	}
+	c.dx += ev.Dragged.DX
+	c.dy += ev.Dragged.DY
+	c.lastAbs = ev.AbsolutePosition
+	c.Move(c.origPos.AddXY(c.dx, c.dy))
+	if c.ghost != nil {
+		c.ghost.Move(c.ghostOrigin.AddXY(c.dx, c.dy))
+	}
+	if c.onDragMove != nil {
+		c.onDragMove(ev.AbsolutePosition)
+	}
+}
+
+// DragEnd implements fyne.Draggable.
+func (c *frameCard) DragEnd() {
+	c.dragging = false
+	if c.ghost != nil {
+		if c.hostCanvas != nil {
+			c.hostCanvas.Overlays().Remove(c.ghost)
+		}
+		c.ghost = nil
+	}
+	if c.onDrag != nil {
+		c.onDrag(c.dx, c.dy, c.lastAbs)
+	}
+	c.dx, c.dy = 0, 0
+}
+
+// moveFrame relocates the item at index from to index to (shifting the
+// others along) and returns the updated slice. from and to must both be
+// valid indices; it's a no-op if they're equal.
+func moveFrame(frames []frameItem, from, to int) []frameItem {
+	if from == to {
+		return frames
+	}
+	item := frames[from]
+	frames = append(frames[:from], frames[from+1:]...)
+	frames = append(frames[:to], append([]frameItem{item}, frames[to:]...)...)
+	return frames
+}
+
+// moveIndex reports where the frame currently at idx ends up after moving
+// the item at from to to (same convention as moveFrame). Used to keep
+// previewIdx pointing at the same frame across a reorder.
+func moveIndex(idx, from, to int) int {
+	switch {
+	case idx == from:
+		return to
+	case from < to && idx > from && idx <= to:
+		return idx - 1
+	case from > to && idx >= to && idx < from:
+		return idx + 1
+	default:
+		return idx
+	}
+}
+
 func (a *App) buildScreenTab() fyne.CanvasObject {
 	var frames []frameItem
 	previewIdx := 0
@@ -400,7 +565,16 @@ func (a *App) buildScreenTab() fyne.CanvasObject {
 	var trash []frameItem
 	trashBox := container.NewHBox()
 	var rebuildTrash func()
-	var trashArea *fyne.Container // set in the layout section; hidden when empty
+	// trashArea is set in the layout section. It stays visible at all times
+	// (even with nothing in it) because it doubles as the drag-to-trash drop
+	// zone — see frameCard's onDrag closure below, which needs a stable,
+	// always-present target to hit-test drops against.
+	var trashArea *fyne.Container
+	// setTrashHighlight is set in the layout section (where the highlight
+	// visuals live). active is true for the whole time any card is being
+	// dragged; hover narrows that to "the pointer is over trashArea right
+	// now" for a stronger cue. rebuildList's per-card callbacks drive it.
+	var setTrashHighlight func(active, hover bool)
 
 	// Frame delay. The field on the wire is 16-bit (protocol.FrameIntervalMax),
 	// so the slider covers the common fast range and the entry takes any exact
@@ -464,49 +638,86 @@ func (a *App) buildScreenTab() fyne.CanvasObject {
 			th.ScaleMode = canvas.ImageScalePixels
 			th.SetMinSize(fyne.NewSize(72, 40))
 
-			left := widget.NewButtonWithIcon("", theme.NavigateBackIcon(), func() {
-				if i > 0 {
-					frames[i-1], frames[i] = frames[i], frames[i-1]
-					if previewIdx == i {
-						previewIdx = i - 1
-					}
-					rebuildList()
-				}
-			})
-			right := widget.NewButtonWithIcon("", theme.NavigateNextIcon(), func() {
-				if i < len(frames)-1 {
-					frames[i+1], frames[i] = frames[i], frames[i+1]
-					if previewIdx == i {
-						previewIdx = i + 1
-					}
-					rebuildList()
-				}
-			})
-			del := widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {
-				removed := frames[i]
-				frames = append(frames[:i], frames[i+1:]...)
-				trash = append([]frameItem{removed}, trash...)
-				if len(trash) > trashCap {
-					trash = trash[:trashCap]
-				}
-				rebuildTrash()
-				rebuildList()
-			})
-			view := widget.NewButtonWithIcon("", theme.VisibilityIcon(), func() {
-				previewIdx = i
-				updatePreview()
-			})
-			if i == 0 {
-				left.Disable()
-			}
-			if i == len(frames)-1 {
-				right.Disable()
-			}
-			card := container.NewVBox(
+			body := container.NewVBox(
 				widget.NewLabelWithStyle(fmt.Sprintf("%d", i+1), fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
 				th,
-				container.NewHBox(left, view, right, del),
 			)
+
+			// card is referenced from within its own onDrag closure (to read
+			// its laid-out size once dragging is under way), so it has to be
+			// declared before it's assigned.
+			var card *frameCard
+			card = newFrameCard(body, a.win.Canvas(), th.Image, i+1,
+				func(absPos fyne.Position) {
+					// Fires on every pointer move of the gesture (including
+					// the first) — keeps the trash strip's highlight on for
+					// the duration of the drag, and intensifies it while the
+					// pointer is actually over the drop zone.
+					hover := false
+					if trashArea != nil {
+						tp := fyne.CurrentApp().Driver().AbsolutePositionForObject(trashArea)
+						ts := trashArea.Size()
+						hover = absPos.X >= tp.X && absPos.X <= tp.X+ts.Width &&
+							absPos.Y >= tp.Y && absPos.Y <= tp.Y+ts.Height
+					}
+					if setTrashHighlight != nil {
+						setTrashHighlight(true, hover)
+					}
+				},
+				func(dx, dy float32, absPos fyne.Position) {
+					// Fires once at DragEnd, whatever the gesture resolved
+					// to (reorder or trash-drop) — always clear the highlight.
+					if setTrashHighlight != nil {
+						setTrashHighlight(false, false)
+					}
+					if i >= len(frames) {
+						return // stale closure: another drag already changed the list
+					}
+					// Dropped onto the trash zone?
+					if trashArea != nil {
+						tp := fyne.CurrentApp().Driver().AbsolutePositionForObject(trashArea)
+						ts := trashArea.Size()
+						if absPos.X >= tp.X && absPos.X <= tp.X+ts.Width &&
+							absPos.Y >= tp.Y && absPos.Y <= tp.Y+ts.Height {
+							removed := frames[i]
+							frames = append(frames[:i], frames[i+1:]...)
+							trash = append([]frameItem{removed}, trash...)
+							if len(trash) > trashCap {
+								trash = trash[:trashCap]
+							}
+							rebuildTrash()
+							rebuildList()
+							return
+						}
+					}
+					// Otherwise, reorder: the whole-gesture horizontal delta,
+					// divided by one card's on-screen footprint (plus the gap
+					// between cards), gives the number of slots moved.
+					slot := card.Size().Width + theme.Padding()
+					if slot <= 0 {
+						slot = 80
+					}
+					offset := int(math.Round(float64(dx) / float64(slot)))
+					if offset == 0 {
+						rebuildList() // no move — snap the dragged card back
+						return
+					}
+					to := i + offset
+					if to < 0 {
+						to = 0
+					}
+					if to >= len(frames) {
+						to = len(frames) - 1
+					}
+					if to != i {
+						frames = moveFrame(frames, i, to)
+						previewIdx = moveIndex(previewIdx, i, to)
+					}
+					rebuildList()
+				}, func() {
+					previewIdx = i
+					updatePreview()
+				})
 			listBox.Add(container.NewPadded(card))
 		}
 		listBox.Refresh()
@@ -543,13 +754,9 @@ func (a *App) buildScreenTab() fyne.CanvasObject {
 			trashBox.Add(container.NewPadded(card))
 		}
 		trashBox.Refresh()
-		if trashArea != nil {
-			if len(trash) == 0 {
-				trashArea.Hide()
-			} else {
-				trashArea.Show()
-			}
-		}
+		// trashArea itself stays visible even when trash is empty — it's the
+		// drag-to-trash drop zone, so it needs to be there (and laid out at a
+		// real position) before the first frame is ever removed.
 	}
 
 	// --- controls ------------------------------------------------------
@@ -826,8 +1033,9 @@ func (a *App) buildScreenTab() fyne.CanvasObject {
 			"A GIF is split into its frames. Up to %d frames on the timeline; the "+
 			"screen loops them at the frame delay (%d–%d ms — the device does not "+
 			"appear to play back any faster than %d ms, so the tool won't send less). "+
-			"Removing a frame drops it into the “Removed frames” strip, where you can "+
-			"restore it. Upload needs the wired keyboard.\n\n"+
+			"Drag a frame left or right to reorder it, or drag it onto the “Removed "+
+			"frames” strip below the timeline to remove it — restore it from there. "+
+			"Upload needs the wired keyboard.\n\n"+
 			"The screen has no transparency. When a source has transparent pixels, "+
 			"a background-colour control appears — those pixels are filled with it "+
 			"before upload (black by default).",
@@ -853,11 +1061,48 @@ func (a *App) buildScreenTab() fyne.CanvasObject {
 
 	trashScroll := container.NewHScroll(trashBox)
 	trashScroll.SetMinSize(fyne.NewSize(0, 80))
-	trashArea = container.NewVBox(
-		widget.NewLabelWithStyle("Removed frames — restore or delete", fyne.TextAlignLeading, fyne.TextStyle{Italic: true}),
+
+	// trashHighlight and trashDropCue are only visible while a frame is
+	// being dragged — a border plus an obvious trash-can icon/label so the
+	// drop-to-delete target is unmistakable. setTrashHighlight (declared
+	// earlier, driven from rebuildList's per-card drag callbacks) toggles
+	// them between off / active (a drag is happening somewhere) / hover
+	// (the pointer is over this strip right now).
+	trashHighlight := canvas.NewRectangle(color.NRGBA{})
+	trashHighlight.StrokeWidth = 3
+	trashDropIcon := widget.NewIcon(theme.DeleteIcon())
+	trashDropLabel := widget.NewLabelWithStyle("Drop to delete", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	trashDropCue := container.NewHBox(container.NewGridWrap(fyne.NewSize(28, 28), trashDropIcon), trashDropLabel)
+	trashDropCue.Hide()
+	setTrashHighlight = func(active, hover bool) {
+		switch {
+		case hover:
+			trashHighlight.StrokeColor = theme.ErrorColor()
+			trashDropIcon.SetResource(theme.NewErrorThemedResource(theme.DeleteIcon()))
+		case active:
+			trashHighlight.StrokeColor = theme.WarningColor()
+			trashDropIcon.SetResource(theme.NewWarningThemedResource(theme.DeleteIcon()))
+		default:
+			trashHighlight.StrokeColor = color.NRGBA{}
+		}
+		trashHighlight.Refresh()
+		if active {
+			trashDropCue.Show()
+		} else {
+			trashDropCue.Hide()
+		}
+	}
+
+	trashArea = container.NewStack(trashHighlight, container.NewVBox(
+		container.NewHBox(
+			widget.NewLabelWithStyle("Removed frames — restore or delete", fyne.TextAlignLeading, fyne.TextStyle{Italic: true}),
+			layout.NewSpacer(),
+			trashDropCue,
+		),
 		trashScroll,
-	)
-	trashArea.Hide()
+	))
+	// Stays visible (even empty) — see rebuildTrash: this is also the
+	// drag-to-trash drop zone, so it can't wait for a first item to exist.
 
 	top := container.NewVBox(
 		title("TFT screen"),

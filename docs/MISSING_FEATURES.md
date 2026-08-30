@@ -49,11 +49,24 @@ existing Screen tab, not new protocol work.
     frame (the common case for a GIF).
   - **Individual frames** — per-frame crop rectangle, for when frames
     were added from different sources.
-- **Frame reordering / deletion.** Replace the per-frame
-  `[◀] [👁] [▶] [🗑]` button row with:
-  - **drag and drop to sort** frames on the timeline.
-  - **drag to trash** — a drop target (top-right of the timeline,
-    roughly) that a dragged frame can be dropped onto to remove it.
+- ~~**Frame reordering / deletion.**~~ **Fixed.** The per-frame
+  `[◀] [👁] [▶] [🗑]` button row is gone; each timeline card
+  (`cmd/k724/tabs.go`, `frameCard`, a small `widget.BaseWidget` implementing
+  `fyne.Draggable`) is now dragged directly:
+  - **drag left/right to reorder** — the whole-gesture horizontal delta
+    (accumulated in `Dragged`, read at `DragEnd`) divided by one card's
+    laid-out width gives the number of slots moved; `moveFrame`/`moveIndex`
+    splice `frames` and keep `previewIdx` pointing at the same frame.
+  - **drag onto the trash zone to delete** — `DragEnd`'s final absolute
+    pointer position is hit-tested against `AbsolutePositionForObject
+    (trashArea)` + its size; a hit does exactly what the old 🗑 button did
+    (append to `trash`, `rebuildTrash()`, `rebuildList()`). `trashArea` (the
+    existing "Removed frames" strip, already sitting directly under the
+    timeline) is the drop target — no second one was built — and now stays
+    visible even when empty so there's always somewhere to drop the very
+    first deleted frame.
+  - The explicit 👁 button stays (unrelated to reordering/deletion); a plain
+    tap on the card body does the same via `frameCard.Tapped`.
 - **Preview pan.** In the zoomed preview image, click and drag to pan
   around the frame (currently the preview is fixed).
 - ~~**Frame-delay lower bound is 50 ms.**~~ **Fixed.** Added
