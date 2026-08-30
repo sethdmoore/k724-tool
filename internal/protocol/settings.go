@@ -40,6 +40,13 @@ const (
 // The field is 16-bit; 50000 ms is the largest value seen from the Windows app.
 const FrameIntervalMax = 50000
 
+// FrameIntervalMin is the smallest screen frame interval this tool will send.
+// The Windows app locks its interval field to a 50 ms minimum, and a test
+// upload at 10 ms did not play any faster on the device — the firmware
+// appears to floor it — so anything below 50 ms is misleading rather than
+// useful. See docs/MISSING_FEATURES.md "Frame-delay lower bound is 50 ms".
+const FrameIntervalMin = 50
+
 // PollingRates maps a polling-index (settings byte 22) to its rate in Hz.
 var PollingRates = [4]int{1000, 500, 250, 125}
 
@@ -162,9 +169,10 @@ func (s *SettingsBlock) FrameIntervalMS() int {
 }
 
 // SetFrameIntervalMS sets the screen frame interval; v is clamped to
-// 1..FrameIntervalMax and written little-endian across bytes 43..44.
+// FrameIntervalMin..FrameIntervalMax and written little-endian across bytes
+// 43..44.
 func (s *SettingsBlock) SetFrameIntervalMS(v int) {
-	v = clampInt(v, 1, FrameIntervalMax)
+	v = clampInt(v, FrameIntervalMin, FrameIntervalMax)
 	s.Raw[offFrameInterval] = byte(v)
 	s.Raw[offFrameInterval+1] = byte(v >> 8)
 }

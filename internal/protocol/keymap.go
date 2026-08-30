@@ -11,9 +11,10 @@ package protocol
 // write_light_a-r_s-g_d-b_q-w_e-bk.pcapng then confirmed the 0x0b colour table
 // uses the identical order (A/S/D/Q/E -> entries 49/50/51/33/35).
 //
-// Slots with no key on this board's ANSI layout, and the four special records
-// that are not plain keys (the volume knob at 13 and codes 0xa0xxxx at 88/89/
-// 111/127), are omitted except Fn, which is included so its LED can be set.
+// Slots with no key on this board's ANSI layout, and the five special
+// records that are not plain keys (the volume knob at 13, which has no LED,
+// and codes 0xa0xxxx at 88/89/111/127), are omitted except Fn, which is
+// included so its LED can be set.
 
 // KeyCap is one key in KeyboardLayout.
 type KeyCap struct {
@@ -32,7 +33,6 @@ var KeyboardLayout = [][]KeyCap{
 		{"F1", 1, 4}, {"F2", 2, 4}, {"F3", 3, 4}, {"F4", 4, 4},
 		{"F5", 5, 4}, {"F6", 6, 4}, {"F7", 7, 4}, {"F8", 8, 4},
 		{"F9", 9, 4}, {"F10", 10, 4}, {"F11", 11, 4}, {"F12", 12, 4},
-		gap(2), {"Knob", 13, 4},
 	},
 	{
 		{"`", 16, 4},
@@ -60,8 +60,11 @@ var KeyboardLayout = [][]KeyCap{
 		{"Z", 66, 4}, {"X", 67, 4}, {"C", 68, 4}, {"V", 69, 4}, {"B", 70, 4},
 		{"N", 71, 4}, {"M", 72, 4}, {",", 73, 4}, {".", 74, 4}, {"/", 75, 4},
 		{"Shift", 77, 7},
+		// Up sits in the arrow-cluster column; it ends exactly where the
+		// nav column (Ins/Del/PgUp/PgDn, all at unit 62) starts, so PgDn
+		// follows with no extra gap and the two columns land flush.
 		gap(2), {"Up", 78, 4},
-		gap(2), {"PgDn", 94, 4},
+		{"PgDn", 94, 4},
 	},
 	{
 		{"Ctrl", 80, 5}, {"Win", 81, 5}, {"Alt", 82, 5},
