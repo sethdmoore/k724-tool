@@ -36,6 +36,7 @@ const (
 	CmdReadAt     = 0x05 // read N bytes at a device offset
 	CmdWriteAt    = 0x06 // write N bytes at a device offset (the settings block)
 	CmdWriteClock = CmdWriteAt
+	CmdBattery    = 0x1A // read battery/status; see battery.go
 	CmdBeginBulk  = 0x23 // "begin bulk image transfer" marker, before the 0x21 run
 	CmdScreen     = 0x21 // TFT frame push, 24-bit device offset in bytes 5-7
 )
@@ -48,12 +49,22 @@ const (
 	ProductIDWireless = 0x511c
 )
 
-// HID usage pages to skip when a caller looks for the vendor command
-// channel. These pages carry the standard keyboard and gamepad interfaces,
-// not the vendor interface.
+// HID usage pages relevant when a caller looks for the vendor command
+// channel. UsagePageGenericDesktop and UsagePageKeyboard carry the standard
+// keyboard interface, not the vendor one. UsagePageVendor (0xff1c) is the
+// confirmed command channel: docs/PROTOCOL.md "Device identity" cites it
+// from a live capture ("the command interface is interface=1, usage page
+// 0xff1c"). A live `hid_enumerate` against real hardware additionally shows
+// two more non-command top-level collections that are neither of the first
+// two pages — Consumer Control (0x000c) and an unlabelled 0xffef — so an
+// exclusion-based filter (skip only GenericDesktop/Keyboard) lets those
+// through too and was the cause of the K724-RGB-PRO appearing twice in the
+// device picker (docs/MISSING_FEATURES.md "Device picker shows each device
+// twice"). IsVendorUsagePage now matches UsagePageVendor directly instead.
 const (
 	UsagePageGenericDesktop = 0x0001
 	UsagePageKeyboard       = 0x0007
+	UsagePageVendor         = 0xff1c
 )
 
 var (
@@ -138,10 +149,11 @@ func ReplyOK(reply []byte, cmd byte) bool {
 	return len(reply) >= 4 && reply[0] == reportMarker && reply[3] == cmd
 }
 
-// IsVendorUsagePage reports whether usagePage belongs to the vendor command
-// channel, as opposed to a standard keyboard or gamepad usage page.
+// IsVendorUsagePage reports whether usagePage is the confirmed vendor
+// command channel (UsagePageVendor), as opposed to any of the keyboard's
+// other HID top-level collections.
 func IsVendorUsagePage(usagePage uint16) bool {
-	return usagePage != UsagePageGenericDesktop && usagePage != UsagePageKeyboard
+	return usagePage == UsagePageVendor
 }
 
 // ClockPayload builds the 49-byte command 0x06 payload that sets the

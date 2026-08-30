@@ -61,6 +61,16 @@ const commitDelay = 15 * time.Millisecond
 func Init() error { return hid.Init() }
 func Exit() error { return hid.Exit() }
 
+// hidHandle is the subset of *hid.Device that Device drives. The real hidapi
+// handle and the in-process simulator (sim.go) both satisfy it, so every
+// probe / read-modify-write / RunSteps code path below runs unmodified
+// against a virtual keyboard — see SimulationEnabled.
+type hidHandle interface {
+	Write(p []byte) (int, error)
+	ReadWithTimeout(p []byte, timeout time.Duration) (int, error)
+	Close() error
+}
+
 // Target identifies one connected keyboard or receiver.
 type Target struct {
 	Path    string
@@ -79,22 +89,47 @@ func (t Target) Label() string {
 	return "Wireless receiver"
 }
 
-// Enumerate returns every K724-RGB-PRO vendor interface currently attached,
-// wired or wireless. Standard keyboard/gamepad interfaces are filtered out.
-func Enumerate() ([]Target, error) {
-	seen := map[string]bool{}
+// enumInfo is the subset of hid.DeviceInfo buildTargets needs. Extracting it
+// keeps the dedup/filter logic in buildTargets unit-testable against a fixed
+// table of captured rows, without touching cgo or needing multi-interface
+// hardware attached.
+type enumInfo struct {
+	Path         string
+	VendorID     uint16
+	ProductID    uint16
+	UsagePage    uint16
+	InterfaceNbr int
+	ProductStr   string
+}
+
+// buildTargets filters infos down to the vendor command-channel collection
+// of each K724-RGB-PRO device, one Target per physical device.
+//
+// A single physical keyboard or receiver enumerates as several rows here:
+// one per USB interface, and often several more per interface (one per
+// top-level HID collection on it — keyboard, consumer control, the vendor
+// channel, and at least one more undocumented vendor-like page all coexist
+// on this hardware). Filtering on protocol.IsVendorUsagePage narrows that
+// down to the confirmed command channel; deduping on (VID, PID) rather than
+// on the interface path is what actually collapses it to one entry, because
+// this keyboard exposes that same usage page on more than one interface
+// (see device_test.go for the exact captured rows this was built against —
+// docs/MISSING_FEATURES.md "Device picker shows each device twice").
+func buildTargets(infos []enumInfo) []Target {
+	seen := map[[2]uint16]bool{}
 	var out []Target
-	err := hid.Enumerate(protocol.VendorID, hid.ProductIDAny, func(info *hid.DeviceInfo) error {
+	for _, info := range infos {
 		if !protocol.IsVendorUsagePage(info.UsagePage) {
-			return nil
+			continue
 		}
 		if info.ProductID != protocol.ProductIDWired && info.ProductID != protocol.ProductIDWireless {
-			return nil
+			continue
 		}
-		if seen[info.Path] {
-			return nil
+		key := [2]uint16{info.VendorID, info.ProductID}
+		if seen[key] {
+			continue
 		}
-		seen[info.Path] = true
+		seen[key] = true
 		out = append(out, Target{
 			Path:    info.Path,
 			Product: info.ProductStr,
@@ -103,12 +138,35 @@ func Enumerate() ([]Target, error) {
 			Iface:   info.InterfaceNbr,
 			Wired:   info.ProductID == protocol.ProductIDWired,
 		})
+	}
+	return out
+}
+
+// Enumerate returns every K724-RGB-PRO currently attached, wired or
+// wireless, one Target per physical device.
+func Enumerate() ([]Target, error) {
+	var infos []enumInfo
+	err := hid.Enumerate(protocol.VendorID, hid.ProductIDAny, func(info *hid.DeviceInfo) error {
+		infos = append(infos, enumInfo{
+			Path:         info.Path,
+			VendorID:     info.VendorID,
+			ProductID:    info.ProductID,
+			UsagePage:    info.UsagePage,
+			InterfaceNbr: info.InterfaceNbr,
+			ProductStr:   info.ProductStr,
+		})
 		return nil
 	})
 	if err != nil {
 		applog.Errorf("enumerate: %v", err)
-		return out, err
+		return nil, err
 	}
+	out := buildTargets(infos)
+	if SimulationEnabled() {
+		out = append(out, simTargets()...)
+		applog.Infof("enumerate: K724_SIM set, added %d simulated target(s)", len(simTargets()))
+	}
+
 	applog.Infof("enumerate: %d vendor interface(s)", len(out))
 	for i, t := range out {
 		applog.Infof("  [%d] %s  %04x:%04x iface=%d  %q  path=%s",
@@ -119,7 +177,7 @@ func Enumerate() ([]Target, error) {
 
 // Device is an open, ping-confirmed connection to the vendor command channel.
 type Device struct {
-	h      *hid.Device
+	h      hidHandle
 	target Target
 
 	// descriptor is the parsed 0x03 reply from probe(). Only the wired open
@@ -181,6 +239,10 @@ func (d *Device) Firmware() Firmware {
 func Open(t Target) (*Device, error) {
 	applog.Infof("open: %s  %04x:%04x  path=%s", t.Label(), t.VID, t.PID, t.Path)
 
+	if isSimPath(t.Path) {
+		return openSim(t)
+	}
+
 	if t.Path != "" {
 		if d, err := openPath(t, t.Path); err != nil {
 			// A permission error is worth surfacing verbatim; keep it.
@@ -234,16 +296,25 @@ func openPath(t Target, path string) (*Device, error) {
 		}
 		return nil, err
 	}
+	return attach(t, h, path)
+}
+
+// attach wraps an already-opened handle in a Device, flushes any stale
+// input, and runs the connection probe. Both openPath (the real hidapi
+// handle) and openSim (the in-process simulator, sim.go) funnel through
+// here so probing behaves identically either way.
+func attach(t Target, h hidHandle, label string) (*Device, error) {
 	d := &Device{h: h, target: t}
 	if n := d.drain(); n > 0 {
-		applog.Infof("openPath %s: flushed %d stale report(s) before probe", path, n)
+		applog.Debugf("openPath %s: flushed %d stale report(s) before probe", label, n)
 	}
 	if err := d.probe(); err != nil {
-		applog.Warnf("openPath %s: probe failed: %v", path, err)
+		applog.Warnf("openPath %s: probe failed: %v", label, err)
 		h.Close()
 		return nil, err
 	}
-	applog.Infof("openPath %s: probe OK", path)
+	applog.Debugf("openPath %s: probe OK", label)
+	applog.Infof("connected: %s  %04x:%04x  %s", t.Label(), t.VID, t.PID, label)
 	return d, nil
 }
 
@@ -440,7 +511,7 @@ func (d *Device) RunSteps(steps []protocol.Step, progress func(done, total int))
 // if ctx is done before a step is sent.
 func (d *Device) RunStepsCtx(ctx context.Context, steps []protocol.Step, progress func(done, total int)) error {
 	if len(steps) > 0 {
-		applog.Infof("runSteps: %d step(s), cmds 0x%02x..0x%02x",
+		applog.Debugf("runSteps: %d step(s), cmds 0x%02x..0x%02x",
 			len(steps), steps[0].Cmd, steps[len(steps)-1].Cmd)
 	}
 	for i, s := range steps {
@@ -460,7 +531,7 @@ func (d *Device) RunStepsCtx(ctx context.Context, steps []protocol.Step, progres
 			progress(i+1, len(steps))
 		}
 	}
-	applog.Infof("runSteps: all %d step(s) OK", len(steps))
+	applog.Debugf("runSteps: all %d step(s) OK", len(steps))
 	return nil
 }
 
@@ -473,7 +544,7 @@ func (d *Device) ReadSettings() (protocol.SettingsBlock, error) {
 	// stale data or time out — which showed up as "Set entered time works once
 	// then not again". A clean read starts from an empty queue.
 	if n := d.drain(); n > 0 {
-		applog.Infof("readSettings: flushed %d stale report(s) first", n)
+		applog.Debugf("readSettings: flushed %d stale report(s) first", n)
 	}
 	var reply []byte
 	for _, s := range protocol.SettingsReadSteps() {
@@ -487,8 +558,10 @@ func (d *Device) ReadSettings() (protocol.SettingsBlock, error) {
 	if err != nil {
 		return b, err
 	}
-	applog.Infof("settings read : %s", b.Summary())
-	applog.Infof("settings read : [% x]", b.Raw[:])
+	// A plain read isn't a user-visible action on its own — ApplySettingsAt
+	// logs at INFO when a write it drove actually changes something.
+	applog.Debugf("settings read : %s", b.Summary())
+	applog.Debugf("settings read : [% x]", b.Raw[:])
 	return b, nil
 }
 
@@ -496,8 +569,8 @@ func (d *Device) ReadSettings() (protocol.SettingsBlock, error) {
 // ApplySettings, which does a ReadSettings (and its queue flush) first, so a
 // separate flush here would only burn another read timeout.
 func (d *Device) WriteSettings(b protocol.SettingsBlock) error {
-	applog.Infof("settings write: %s", b.Summary())
-	applog.Infof("settings write: [% x]", b.Raw[:])
+	applog.Debugf("settings write: %s", b.Summary())
+	applog.Debugf("settings write: [% x]", b.Raw[:])
 	return d.RunSteps(protocol.SettingsWriteSteps(b), nil)
 }
 
@@ -512,15 +585,38 @@ func (d *Device) ApplySettings(mutate func(*protocol.SettingsBlock)) error {
 // current time. Use it only to prove a write took effect (see cmd/setclock
 // -test); normal writes should stamp the real time.
 func (d *Device) ApplySettingsAt(when time.Time, mutate func(*protocol.SettingsBlock)) error {
-	b, err := d.ReadSettings()
+	before, err := d.ReadSettings()
 	if err != nil {
 		return err
 	}
+	b := before
 	if mutate != nil {
 		mutate(&b)
 	}
 	b.SetTime(when)
-	return d.WriteSettings(b)
+	if err := d.WriteSettings(b); err != nil {
+		return err
+	}
+	// Every write re-stamps the clock, so comparing the full block would log
+	// "changed" on a bare clock sync too; settingsChangedIgnoringTime asks
+	// whether mutate actually touched anything a user would notice.
+	if settingsChangedIgnoringTime(before, b) {
+		applog.Infof("settings write: %s", b.Summary())
+	}
+	return nil
+}
+
+// settingsChangedIgnoringTime reports whether a and b differ anywhere except
+// the BCD timestamp (settings bytes 35-41 — docs/PROTOCOL.md "Settings block
+// layout"). ApplySettingsAt re-stamps the clock on every write, so comparing
+// the full block would treat a bare clock sync as a "change" too.
+func settingsChangedIgnoringTime(a, b protocol.SettingsBlock) bool {
+	const timeOff, timeLen = 35, 7
+	ac, bc := a.Raw, b.Raw
+	for i := timeOff; i < timeOff+timeLen; i++ {
+		ac[i], bc[i] = 0, 0
+	}
+	return ac != bc
 }
 
 // SyncClock stamps the current local time into the settings block, leaving
@@ -578,6 +674,27 @@ func (d *Device) UploadScreen(ctx context.Context, frames [][]byte, intervalMS i
 	}
 	applog.Infof("uploadScreen: %d frame(s) delivered", len(frames))
 	return nil
+}
+
+// Battery reads the command 0x1A battery/status value. See
+// internal/protocol/battery.go: the byte map is a hypothesis (0x64 = 100
+// observed once, wired and wireless both), not a confirmed percentage field,
+// so callers should treat the result as "probably right."
+func (d *Device) Battery() (protocol.BatteryStatus, error) {
+	var reply []byte
+	for _, s := range protocol.BatteryReadSteps() {
+		r, err := d.Transact(s)
+		if err != nil {
+			return protocol.BatteryStatus{}, err
+		}
+		reply = r
+	}
+	b, err := protocol.ParseBatteryReply(reply)
+	if err != nil {
+		return b, err
+	}
+	applog.Infof("battery read: %d%% (raw [% x])", b.Percent, b.Raw)
+	return b, nil
 }
 
 // IsPermissionError reports whether err looks like an OS permission denial on
