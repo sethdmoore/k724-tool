@@ -2,165 +2,206 @@
 
 The K724-RGB-PRO has a small TFT screen that shows a static image or a
 short animation. This document covers the on-disk frame format and the
-state of the investigation into how a frame gets to the device through
-USB.
+wire format of a frame upload.
 
-Nothing in this file is **confirmed** by a live USB capture. Every
-claim below is a **hypothesis** from static analysis, unless marked
-otherwise. See `docs/PROTOCOL.md` for the confidence key.
+**The upload path is now confirmed by a live `usbmon` capture.** Session
+4 captured the Windows app uploading images over the **wired** keyboard
+(`320f:511b`) and the decoded pixel payload matches the source bitmaps
+byte for byte. The static-analysis hypothesis from session 3 (command
+`0x21`, RGB565, one buffer per frame) was correct. Claims below are
+marked **confirmed** where the capture backs them and **hypothesis**
+where only static analysis does. See `docs/PROTOCOL.md` for the
+confidence key.
 
-## `ScreenFrame.json` structure
+Capture files: `../captures/screen.pcapng` (three-frame R/G/B bucket
+fill, uploaded twice at 100 ms and 200 ms frame delay) and
+`../captures/gradient.pcapng` (two 45-degree grayscale gradient frames,
+`grad0.bmp` / `grad1.bmp`, 200 ms delay). Decoder:
+`../../k724-tool/python/parse_screen_capture.py`.
+
+## Screen resolution (confirmed)
+
+**240 x 135**, 32,400 pixels. Confirmed three ways: every frame's pixel
+payload is exactly `32400 * 2 = 64800` bytes; the decoded gradient
+frames render the right way up with all four corners correct; and a
+byte-for-byte compare of the decoded gradient frames against
+`grad0.bmp` / `grad1.bmp` is a 100.0% match (64800/64800 bytes).
+
+Note the earlier `180 x 180` guess from `ScreenFrame.json`'s pixel
+count was wrong but *numerically coincidental*: `180 * 180` and
+`240 * 135` are both 32,400.
+
+## Pixel format (confirmed)
+
+- **Big-endian RGB565**, one 16-bit word per pixel, packed
+  `RRRRRGGG GGGBBBBB` with the high byte first on the wire.
+  - Pure red `255,0,0` → `0xF800` → bytes `F8 00`.
+  - Pure green `0,255,0` → `0x07E0` → bytes `07 E0`.
+  - Pure blue `0,0,255` → `0x001F` → bytes `00 1F`.
+- **Row-major, top-left origin.** Pixel `(x, y)` is at byte
+  `(y * 240 + x) * 2` within the frame. (Source BMPs are bottom-up;
+  the app flips them before upload.)
+- No per-frame header. The pixel data starts at byte 0 of the frame
+  slot.
+
+`parse_screen_capture.py --width 240 --height 135` unpacks each frame
+back to a PNG with this format.
+
+## Frame slot layout in device memory (confirmed)
+
+Command `0x21` carries a 24-bit device offset (see below). Frames are
+written into a flat device address space at a fixed stride:
+
+| Frame index | Device offset | Payload |
+|---|---|---|
+| 0 | `0x00000` | 64800 bytes RGB565, then padding to `0x10000` |
+| 1 | `0x10000` | same |
+| 2 | `0x20000` | same |
+| ... | `k * 0x10000` | ... |
+
+- **Stride is `0x10000` (65536) bytes per frame.** A 3-frame upload
+  writes offsets `0` through `0x2FFD0 + 48 = 0x30000` in one
+  unbroken run of `0x21` chunks; a 2-frame upload writes through
+  `0x20000`. There is **no protocol delimiter between frames** — the
+  frame boundary is purely the `0x10000` offset stride.
+- Bytes `64800 .. 65535` of each slot are **padding**. When the frame
+  was drawn in the editor (the R/G/B bucket-fill capture) the padding
+  is all zero. When the frame came from an imported image file (the
+  gradient capture) the padding holds ~726 bytes of non-zero data that
+  is **byte-identical between the two frames of that upload** and looks
+  like uninitialised application heap (repeating little-endian
+  pointer/float-shaped words, e.g. `b8 bf 26 11`). Treat it as stale
+  scratch memory, not protocol data — a client should zero-fill it.
+  This is the same class of "leftover-buffer artifact" noted for the
+  one anomalous checksum in `docs/PROTOCOL.md`.
+
+## Upload wire sequence (confirmed)
+
+For one image or animation upload, in order:
+
+1. `0x01` — begin.
+2. `0x06` write, 49-byte payload at device offset 0 — the
+   **screen-config block** (see below).
+3. `0x02` — commit the config block.
+4. `0x23` — no payload. "Begin bulk image transfer" marker. This is
+   the delimiter a decoder uses to find the start of a pixel stream.
+5. Many `0x21` chunks. Device offset starts at 0 and increases by the
+   chunk length each packet. Chunk length is `0x38` (56) for every
+   chunk except the last of each `0x10000` slot, which is `0x30` (48)
+   — `64800 = 1157 * 56 + 8`, so slots do not divide evenly by 56 and
+   the app just sends a short final chunk. The offset runs
+   continuously across all frames (it does **not** reset to 0 per
+   frame).
+6. `0x02` — commit the upload.
+
+Every `0x21` request gets a response whose byte 3 is `0x21` and which
+echoes the same offset (confirmed in the capture). The standard
+checksum formula from `docs/PROTOCOL.md` holds for `0x21` with no
+exceptions (0 mismatches across 7022 `0x21` packets in `screen.pcapng`).
+
+### Command `0x21` framing (confirmed)
+
+`0x21` is the only write command with a **24-bit (3-byte)** device
+offset. It reuses the 64-byte report frame from `docs/PROTOCOL.md` but
+byte 7 is the offset's high byte, not a reserved zero:
+
+| Byte | Field |
+|---|---|
+| 0 | `0x04` marker |
+| 1-2 | 16-bit LE checksum, `sum(byte[3 : 8+chunklen]) & 0xFFFF` |
+| 3 | `0x21` |
+| 4 | chunk length (`0x38`, or `0x30` for a slot's final chunk) |
+| 5-7 | **24-bit little-endian device offset** |
+| 8... | chunk data, zero-padded to 64 bytes total |
+
+Example high-offset request from `screen.pcapng`:
+`04 30 02 21 38 d8 fd 02 ...` → checksum `0x0230`, cmd `0x21`, len
+`0x38`, offset `0x02fdd8` = 196056.
+
+## The `0x06` screen-config block (confirmed fields, partial)
+
+A 49-byte `0x06` write to device offset 0, sent just before the `0x23`
++ `0x21` burst (and also once at app startup, pushing whatever screen
+state is currently loaded). Observed payloads, variable bytes in
+**bold**:
 
 ```
-{
-  "Frame": [
-    {
-      "BkGroundColor": { "Red": 0, "Green": 0, "Blue": 0 },
-      "PenColor": { "Red": 255, "Green": 38, "Blue": 42 },
-      "Pixel": [
-        { "Red": 0, "Green": 0, "Blue": 0, "Flag": 0 },
-        ...
-      ]
-    }
-  ]
-}
+00 13 05 00 00 00 00 00 ff 06 00 00 00 b4 00 ff 00 ff 00 00 ff 00 [PR]
+00 00 00 00 00 00 00 00 00 ff 00 02 [FC] [SS MM HH WD DD MM YY] 00 [INT]
+00 00 00 01 02
 ```
 
-- `Frame` is an array. The shipped default file has exactly one
-  frame, a blank black 180x180 image.
-- Each frame has 32,400 `Pixel` entries — confirmed to be `180 x 180`
-  by direct count (`sqrt(32400) = 180`), in what is assumed to be
-  row-major order (not directly confirmed).
-- `BkGroundColor` and `PenColor` are per-frame metadata, not part of
-  the pixel grid. `PenColor` matches the "Pen:" tool color shown in
-  the screen editor UI (`Skin/lan_en.xml`, `pen_color_text`). It is
-  the drawing tool's current color, not a device setting.
-- Each `Pixel` entry's `Flag` field is `0` in every entry of the
-  shipped default file, so its purpose could not be inferred from this
-  data alone. It stays **unknown**.
+`[PR]` = byte 22, USB polling-rate index (left at whatever the polling tab
+last set). `[FC]` = byte 34, frame count. `[INT]` = bytes 43-44, frame
+interval (16-bit LE — see below).
 
-`Keyboard.json`'s `Device[0].FrameIntervalTime` (`100` in the shipped
-default) is almost certainly the per-frame delay in milliseconds for
-animation playback, based on the field name, but this is not
-confirmed against device behavior.
+| Payload offset | Field | Evidence |
+|---|---|---|
+| 22 | USB polling-rate index — **not** frame count | Re-checked against `screen.pcapng`: byte 22 is `0x03` in every screen write, matching the 125 Hz polling rate left set by the earlier `change_polling` capture, and it does **not** track the frame count. `docs/PROTOCOL.md` is right; the earlier "frame count at 22 and 34" note was wrong. |
+| 34 | **Frame count** | `0x01` at startup, `0x03` for the 3-frame animation, `0x02` for the 2-frame gradient. This is the only frame-count byte. |
+| 35 | Second, BCD | Varies with wall-clock time across the captures. |
+| 36 | Minute, BCD | Same 7-field `SS MM HH WD DD MM YY` BCD block as the clock write in `docs/PROTOCOL.md`. |
+| 37 | Hour, BCD (24 h) | Capture times 13:53 / 13:54 / 14:07 / 14:13 line up with the file mtimes. |
+| 38 | Weekday, BCD | `0x05` = Friday (2026-08-28), matches `0`=Sun..`6`=Sat. |
+| 39 | Day, BCD | `0x28` = 28. |
+| 40 | Month, BCD | `0x08` = August. |
+| 41 | Year, BCD | `0x26` = 2026. |
+| 43-44 | **Frame interval, ms — 16-bit little-endian** | `0x64 00` = 100 and `0xC8 00` = 200 in the early captures, which read as a single byte. `write_light_a-r_s-g_d-b_q-w_e-bk.pcapng` carries `50 c3` = `0xC350` = 50000 here, matching the Windows app's "Interval time 50000 ms" field, and a live `0x05` read of the block on KB V0206 confirmed `50 c3` at 43-44. So the field is two bytes; the earlier single-byte reading only held because nothing had exceeded 255 ms. This is `Keyboard.json`'s `FrameIntervalTime` on the wire. |
+| all others | Fixed template | Identical across all six of the original screen captures. |
 
-## Screen editor UI (from `Skin/lan_en.xml` and `Skin/screen.xml`)
+**This overlaps the "clock write" from `docs/PROTOCOL.md`.** Both are
+`0x06` writes to offset 0, both 49 bytes, both carry the same 7-field
+BCD timestamp at the same offsets 35-41, and both end
+`... 00 [INT] 00 00 00 01 xx`. The wireless "clock" capture from
+session 3 and this wired "screen-config" capture look like **the same
+config block** with the timestamp as one field among frame-count and
+frame-interval. The RTC still updates from the timestamp field (session
+3 saw the keyboard's clock visibly correct), but "command `0x06` = set
+clock" is too narrow — it is a combined screen/clock settings write.
+The fixed-template bytes differ between the wired and wireless captures
+(`00 13 05 ...` vs `00 05 03 02 00 01 cc cc cc ...`), which is the most
+likely cause of the wired clock-set misfire documented in the README —
+see the note there.
 
-The editor supports:
+## Animation limits
 
-- A pen tool and an eraser tool.
-- Frame operations: add, delete, clear, and reverse, each for a
-  single frame or for all frames.
-- Import of a picture or a GIF animation.
-- Export of the current frame, or the whole animation, back to a
-  picture or a GIF.
-- Upload to the device.
+The screen editor's `save_over_pictrue_count` string says "Saves a
+maximum of 25 frames of images." Uploads of 2 and 3 frames were
+captured. Re-uploading the same frames with only the interval changed
+produces a byte-identical pixel stream, so nothing in the `0x21` data
+depends on frame timing — that lives entirely in the `0x06` block.
 
-Two UI strings distinguish a single-frame upload from a
-full-animation upload: `uploading_frame_text` ("uploading frame") and
-`uploading_all_frame_text` ("uploading all frame"). Another string
-(`save_over_pictrue_count`) states a hard limit: "Saves a maximum of
-25 frames of images." A third (`upload_erro_text`) states "Only the
-wired mode upload is supported!" The screen upload path is gated to
-the wired connection and is not expected to work through the 2.4 GHz
-receiver.
+## Wired vs wireless
 
-## What earlier static analysis ruled out
+The capture is over the **wired** keyboard (`320f:511b`), matching the
+editor's `upload_erro_text` string, "Only the wired mode upload is
+supported!" The screen path is not expected to work through the
+`320f:511c` receiver, and no attempt to send it there has been made.
 
-`RE_STATUS.md` names five functions as the screen editor's image
-import/export routines: `FUN_004afcc0`, `FUN_004b3940`, `FUN_004b4030`,
-`FUN_004b4930`, `FUN_004b5590`. This investigation re-decompiled all
-five and searched their code specifically for calls to the two
-command-transaction functions (`FUN_004817f0`, `FUN_00482300`) and to
-`WriteFile`/`HidD_SetOutputReport` directly. None of the five call any
-of these. `FUN_004afcc0` uses OpenCV (`cv::imread`, `cv::transpose`,
-`cv::resize`, `cv::flip`) to load a picture file from disk.
-`FUN_004b4930` writes local files in a `ScreenFames` (sic)
-directory. **None of the five talk to the device.** This confirms and
-strengthens RE_STATUS's original conclusion, rather than leaving it as
-an open guess.
+## Still open
 
-The per-key RGB lighting sender (`FUN_004950a0`, see
-`docs/RGB_LIGHTING.md`) was also independently confirmed, again, to be
-unrelated: it sends fixed 17-byte `0xFF`-marker reports with no image
-data shape, nothing like a pixel buffer.
+- The two `0x06` template bytes that differ wired vs wireless
+  (`docs/PROTOCOL.md` prefix `00 05 03 02 00 01 cc cc cc` vs this
+  `00 13 05 00 00 00 00 00 ff`) are not decoded. Resolving them is the
+  path to a safe wired clock-set (README "known issue").
+- `0x0A` / `0x0B` fire at app startup in both captures with a
+  3-bytes-per-entry body (`00 00 ff` repeating, ~342 entries) — this
+  is the per-key RGB restore, not screen data, but the exact body
+  format is not written up in `docs/RGB_LIGHTING.md` yet.
+- Whether an upload of >3 frames changes the slot stride or the
+  `0x06` block shape (only 2- and 3-frame uploads captured).
+- The `0x03` / `0x07` / `0x1B` reads at the very start of every
+  session return all-zero request bodies here (they are reads); their
+  response bodies were not re-examined in this session.
 
-## The strongest lead found in this investigation: `FUN_004b1220` / `FUN_004b15d0`
+## Reproduce
 
-Searching for callers of command `0x21` — the one write command whose
-device offset field is 3 bytes (24-bit) instead of the usual 2 bytes
-(16-bit), see `docs/COMMANDS.md` — turned up exactly two functions:
-`FUN_004b1220` and `FUN_004b15d0`. The two functions sit in the same
-address range as the five screen functions above (between
-`FUN_004afcc0` at `0x4afcc0` and `FUN_004b3940` at `0x4b3940`), which
-was not true of any other unidentified command's callers.
+```
+cd k724-tool/python
+python3 parse_screen_capture.py ../captures/screen.pcapng   --width 240 --height 135 --out ./decoded
+python3 parse_screen_capture.py ../captures/gradient.pcapng --width 240 --height 135 --out ./decoded
+```
 
-Decompiling the two functions directly shows a strong, consistent
-picture:
-
-- The two functions look up a UI control literally named
-  `screen_view_tab` and confirm its runtime type is
-  `DuiLib::CScreenViewControlUI` before doing anything else.
-- The two functions compute a buffer size as `width * height * 2`
-  (bytes), where `width`/`height` are read from object fields. Two
-  bytes per pixel is consistent with a 16-bit color format, not the
-  3-bytes-per-pixel (`Red`/`Green`/`Blue`) format `ScreenFrame.json`
-  uses on disk.
-- The two functions run a per-pixel conversion loop that is, byte for
-  byte, a standard RGB565 pack: it takes 3 source bytes, keeps the top
-  5 bits of the first, the top 6 bits of the second, and the top 5
-  bits of the third, and packs them into 2 destination bytes as
-  `RRRRRGGG GGGBBBBB` (5-6-5 bits, big-endian byte order). This is a
-  common wire format for small SPI TFT controllers.
-- The two functions call `FUN_00483fd0` — the builder for command
-  `0x21` — passing the freshly built RGB565 buffer and its byte length
-  directly as the payload, immediately followed by command `0x02`
-  (commit, see `docs/COMMANDS.md`).
-- The two functions post a custom window message (`0x4901`) as an
-  upload-progress callback — the same message ID that `FUN_00483fd0`
-  itself posts internally during a chunked send, tying the two
-  together.
-- The two functions call `FUN_00482530` (command `0x01`) and
-  `FUN_00483dc0` (command `0x23`) immediately before the `0x21` bulk
-  write, matching the general "prepare, then bulk-write, then commit"
-  shape seen elsewhere in the protocol.
-- `FUN_004b15d0` also loops through a frame count field, building
-  and concatenating one RGB565 buffer per frame before the single
-  `0x21` write — matching the "upload all frame" UI string, while
-  `FUN_004b1220`'s single-buffer version matches "uploading frame".
-- After the upload, `FUN_004b1220` calls `FUN_004b4930` and
-  `FUN_004b15d0` calls `FUN_004b5590` — two of the five originally
-  named "screen editor" functions. Given `FUN_004b4930` writes local
-  cache files (see above), this looks like post-upload local
-  bookkeeping, not a second device call.
-
-**This is a well-supported hypothesis, not a confirmed finding.** No
-live capture has observed a screen/GIF upload. But it is a specific,
-falsifiable claim: a live capture of the app's "Upload" button in the
-View Screen tab would show command `0x21` writes whose payload, when
-unpacked as big-endian RGB565, reproduces the uploaded image.
-
-## Remaining open questions
-
-- The exact device screen resolution. `180 x 180` is inferred only
-  from `ScreenFrame.json`'s pixel count, not read from the binary's
-  `width`/`height` fields directly.
-- Whether `ScreenFrame.json`'s on-disk `Pixel[].Flag` field carries
-  any wire-visible meaning, or is purely an editor-side bookkeeping
-  bit (for example, "pixel touched by the pen tool").
-- The source bitmap's layout that `FUN_004b1220`/`FUN_004b15d0` read
-  from (row stride `0x780` = 1920 bytes, column stride 8 bytes, base
-  offset `0x3df2c`) was not traced back to a named structure. It is
-  presumably a larger, live-rendered editor canvas being downsampled
-  to the device's actual resolution, not `ScreenFrame.json` read
-  directly, but this was not confirmed.
-- Command `0x23`'s exact role (paired with `0x21` in the two
-  functions, but never decompiled in isolation beyond "no payload").
-- Whether commands `0x09`, `0x12`, or `0x15` (see `docs/COMMANDS.md`)
-  play any role in the screen path. They were checked and ruled out
-  as direct callers of the screen functions, but their own callers
-  were not fully traced.
-
-A live capture of a screen upload — the same technique that resolved
-the clock protocol in session 3 — is the clear next step to move this
-from hypothesis to confirmed.
+`decoded/burstNN.png` is each uploaded frame. The collapsed
+"unique frames" list printed to stdout is the de-duplicated command
+sequence.

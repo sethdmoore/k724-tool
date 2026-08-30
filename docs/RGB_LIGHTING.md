@@ -4,10 +4,63 @@ This document covers two separate things: the per-key lighting HID
 report that pushes live color data to the keyboard, and the list of
 named lighting effect modes the app exposes in its UI.
 
-Nothing in this file is **confirmed** by a live USB capture. Every
-claim below is a **hypothesis** from static analysis (Ghidra
+The **command `0x0b`** section immediately below is **confirmed** by a
+live capture (`write_light_a-r_s-g_d-b_q-w_e-bk.pcapng`). Everything
+after it — the 17-byte `0xFF` `HidD_SetOutputReport` path and the mode
+ID table — is still a **hypothesis** from static analysis (Ghidra
 decompilation of `FUN_004950a0`, plus JSON/XML inspection), unless
 marked otherwise. See `docs/PROTOCOL.md` for the confidence key.
+
+## Per-key custom colours: command `0x0b` (confirmed)
+
+`write_light_a-r_s-g_d-b_q-w_e-bk.pcapng` captures the Windows app's
+"Custom" effect being edited on the **wired** keyboard (`320f:511b`),
+one key at a time: A→red, S→green, D→blue, Q→white, E→black. It is all
+on the ordinary `0x04`-marker command channel — **not** the 17-byte
+`0xFF` `HidD_SetOutputReport` path below, which no capture has ever
+shown in use.
+
+Each "apply" is two phases:
+
+1. `0x01` → seven `0x0b` chunks → `0x02`. The chunks carry a **384-byte
+   table = 128 entries × 3 bytes (R, G, B)**, one entry per key/LED, at
+   climbing device offsets `0x00 / 0x38 / 0x70 / 0xa8 / 0xe0 / 0x118 /
+   0x150` (56 bytes each, last chunk 48). Same chunking as the `0x09`
+   key-remap table.
+2. `0x01` → a normal `0x06` settings-block write → `0x02`, with byte 1
+   (effect) set to `0x13` = 19 = "Custom" and bytes 6-8 (global colour)
+   set to the last colour the user picked.
+
+**Entry order = the `0x09` key-remap table's order.** Every `0x09` entry
+in `button_write_j_default_key.pcapng` is `20 00 <hid-usage>`
+(`0x29` Esc, `0x3a`-`0x45` F1-F12, `0x14` Q, `0x04` A, …), so that
+table names all 128 slots. The five keys the colour capture touched
+landed on exactly the slots that map predicts: Q=33, E=35, A=49, S=50,
+D=51. `internal/protocol/keymap.go` encodes the resulting layout for a
+75 % ANSI board; slots 88/89/111/127 and the volume knob at 13 carry
+`0xa0…` special records rather than plain keys.
+
+**Per-key brightness is folded into the RGB.** The `0x0b` entry is only
+3 bytes — there is no per-key alpha byte on the wire — but the saved
+profile (`profile1.json`) keeps a 4th value per key:
+`CustomLightMode.LightColorInfo[*].Alpha`, which takes intermediate
+values (that profile has a mix of `255` and `201`), not just 0/255. So
+the Windows app stores a per-key brightness and flattens it before
+sending: `wire_channel ≈ round(channel * alpha / 255)`. The exact
+rounding is unconfirmed — every `0x0b` byte in the capture is `0x00` or
+`0xff` because the edit session never used a partial brightness — but
+this is the only place the value can go. (This is a *client-side* scale,
+unrelated to the `0xf7` clamp in `FUN_004950a0`, which is on the
+separate 17-byte channel below.) The `LightColorInfo` array has 170
+entries to the wire table's 128; the extra 42 are unpopulated LED slots
+(see the `0xAA`/170 note under "What was not resolved").
+
+There is no observed read-back for the `0x0b` table, so a client must
+keep its own authoritative copy. `internal/protocol/customkeys.go`
+(`KeyColorTable`, `KeyColorWriteSteps`) and `k724.Device.ApplyKeyColors`
+implement both phases; the GUI keeps an RGBA model (RGB + per-key
+brightness), derives the wire table by the scale above, and persists the
+model to `fyne.Preferences`.
 
 ## The per-key lighting report is a separate channel
 
