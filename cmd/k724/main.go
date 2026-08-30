@@ -127,6 +127,7 @@ func (a *App) build() fyne.CanvasObject {
 		container.NewTabItem("Lighting", a.buildLightingTab()),
 		container.NewTabItem("Polling", a.buildPollingTab()),
 		container.NewTabItem("Screen", a.buildScreenTab()),
+		container.NewTabItem("Info", a.buildInfoTab()),
 		container.NewTabItem("Log", a.buildLogTab()),
 	)
 

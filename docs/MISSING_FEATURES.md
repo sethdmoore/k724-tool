@@ -56,30 +56,23 @@ existing Screen tab, not new protocol work.
     roughly) that a dragged frame can be dropped onto to remove it.
 - **Preview pan.** In the zoomed preview image, click and drag to pan
   around the frame (currently the preview is fixed).
-- **Frame-delay lower bound is 50 ms.** The Windows app locks the
-  interval field to a 50 ms minimum. k724-tool currently allows 10 ms
-  (slider `widget.NewSlider(10, 2000)` and the entry, in
-  `cmd/k724/tabs.go`; `SetFrameIntervalMS` in
-  `internal/protocol/settings.go` clamps to `1..FrameIntervalMax`).
-  A test upload at 10 ms does **not** play faster on the device — the
-  firmware appears to floor it — so the sub-50 ms range is misleading.
-  Add a `FrameIntervalMin = 50` constant, clamp to it in
-  `SetFrameIntervalMS`, and raise the slider min + default to 50.
+- ~~**Frame-delay lower bound is 50 ms.**~~ **Fixed.** Added
+  `protocol.FrameIntervalMin = 50`; `SetFrameIntervalMS` now clamps to
+  `FrameIntervalMin..FrameIntervalMax`, and the Screen tab's slider
+  (`cmd/k724/tabs.go`) starts at 50 instead of 10.
 
-## Keyboard layout diagram — fixes
+## Keyboard layout diagram — fixed
 
-Nitpicks in the per-key colour grid (`internal/protocol/keymap.go`,
-`KeyboardLayout`).
+~~Nitpicks in the per-key colour grid~~ Both fixed in
+`internal/protocol/keymap.go`'s `KeyboardLayout`, locked in by
+`keymap_test.go`:
 
-- **Nav column alignment.** Ins / Del / PgUp / PgDn must line up
-  perfectly vertically, sitting slightly to the right of the Up arrow.
-  Right now each is placed with a `gap(2)` after a differently-sized
-  main block on its row, so the column is ragged.
-- **Remove the knob.** The volume knob (index 13) has no LED, so it
-  should not be in the diagram at all. `keymap.go`'s own header comment
-  already says the knob is meant to be omitted like the other special
-  `0xa0…` records — the `{"Knob", 13, 4}` entry contradicts that and
-  should go.
+- **Nav column alignment** — Ins / Del / PgUp / PgDn now all start at
+  the same cumulative unit offset (62) within their row, so the editor
+  grid draws one straight column, sitting to the right of the Up-arrow
+  column (58).
+- **Knob removed** — the volume knob (index 13) had no LED; the
+  `{"Knob", 13, 4}` entry (and its trailing gap) is gone.
 
 ## GUI — bugs and polish
 
@@ -96,53 +89,61 @@ Nitpicks in the per-key colour grid (`internal/protocol/keymap.go`,
   - gain two buttons: **Open log folder** and **Open log file** (open
     the containing directory / the file itself in the OS default
     handler).
-- **Device picker shows each device twice.** The dropdown lists
-  "Wired keyboard — Gaming KB" ×2 and "Wireless receiver — 2.4G
-  Wireless Receiver" ×2. `internal/k724.Enumerate` is returning more
-  than one HID path per physical device (multiple interfaces /
-  collections on the vendor usage page). Dedupe so each physical
-  device appears once — key on something stable (USB serial, or
-  VID:PID + interface, or the container/parent path), not the raw
-  hidraw path.
+- ~~**Device picker shows each device twice.**~~ **Fixed.** Root cause:
+  `protocol.IsVendorUsagePage` excluded only the standard keyboard/generic-
+  desktop usage pages, but this keyboard also exposes a Consumer Control
+  collection (`0x000c`) and an unlabelled `0xffef` one that both slipped
+  through the same "not those two" filter, and separately the confirmed
+  vendor page (`0xff1c`) shows up on two different interfaces of the same
+  physical wireless receiver. `IsVendorUsagePage` now matches `0xff1c`
+  directly; `internal/k724.Enumerate` dedupes on `(VID, PID)` — see
+  `buildTargets` in `device.go` and the real-hardware capture fixture in
+  `device_test.go`. Verified live: `setclock -list` went from four lines
+  to two against a real (if only USB-topology-visible) K724.
 
 ## Info tab
 
-Add an **Info** tab that shows:
+~~Add an **Info** tab~~ **Done.** `cmd/k724/tabs.go` `buildInfoTab`, wired
+into the tab bar in `main.go`, shows:
 
-- the connected keyboard's **firmware versions** — KB and AP — which
-  the tool already reads from the `0x03` descriptor block on the wired
-  connect (see `README.md` → "Firmware compatibility" and
-  `docs/COMMANDS.md` → "Command `0x03`"). Right now those values are
-  only used for the mismatch banner; surface them plainly here.
-- the **product / device identity** — model string, VID:PID, wired vs
-  wireless, HID path.
-- k724-tool's **own version** (build version / commit).
+- the connected keyboard's **firmware versions** — KB and AP — read from
+  the same cached `Device.Firmware()` the mismatch banner already uses
+  (see `README.md` → "Firmware compatibility" and `docs/COMMANDS.md` →
+  "Command `0x03`").
+- the **product / device identity** — product string, VID:PID, wired vs
+  wireless label, HID path.
+- **battery** — new: `protocol.CmdBattery` (`0x1A`) + `Device.Battery()`,
+  shown with an explicit "hypothesis, not confirmed" caveat (see
+  `internal/protocol/battery.go` and `docs/COMMANDS.md`'s `0x1A` entry —
+  only one capture of this reply exists, always at 100%, over both wired
+  and wireless).
+- k724-tool's **own version** — the git revision Go embeds automatically
+  via `runtime/debug.ReadBuildInfo()`, falling back to `"dev"` for a
+  `go run` build with no VCS info embedded.
 
-Effectively a read-only "About this keyboard + about this tool" panel.
+A "Refresh" button re-reads firmware + battery on demand; both also
+refresh automatically on connect.
 
 ## Logging — finer levels, quieter default
 
-`internal/applog` currently has only `INFO` / `WARN` / `ERROR`
-(`Infof`/`Warnf`/`Errorf`) and **no level filtering** — every line is
-written. Everything device-related logs at `INFO`, so the normal Log
-tab is a wall of hex.
+**Backend done; UI exposure still open.** `internal/applog` now has a
+`Level` type (`LevelDebug`/`LevelInfo`/`LevelWarn`/`LevelError`),
+`Debugf`, `SetLevel`/`GetLevel`, and `ParseLevel`; the default threshold
+is `LevelInfo`, overridable with the `K724_LOG_LEVEL` env var so a bug
+report can be captured at `DEBUG` without a rebuild already, just not yet
+from the running GUI. All of the noisy lines called out below moved to
+`Debugf`: the settings-block hex dumps, `readSettings: flushed …`,
+both `runSteps: …` lines, and the `openPath …: flushed / probe OK`
+chatter. `ApplySettingsAt` now only logs its decoded `settings write:
+effect=5 …` line at `INFO` when the write actually changes a field other
+than the timestamp (a bare clock sync no longer produces a "changed"
+line); a plain `ReadSettings` never logs above `DEBUG`. `attach()` adds
+one new `INFO` "connected: …" line. Verified with a throwaway harness
+against the simulator: a clock-only sync + one real settings change
+produced 5 `INFO` lines total (vs. 18 at `DEBUG`).
 
-Wanted:
+Still wanted:
 
-- **Add a `DEBUG` level** (`Debugf`) and a settable threshold. Default
-  threshold stays `INFO`.
-- **Demote the noisy lines to `DEBUG`:**
-  - the raw settings-block hex dumps (`settings read : [00 05 04 …]`,
-    `settings write: [ … ]`).
-  - `readSettings: flushed N stale report(s) first`.
-  - `runSteps: N step(s), cmds 0x01..0x02` and `runSteps: all N
-    step(s) OK`.
-  - the `openPath …: flushed / probe OK` chatter.
-- **Keep at `INFO`:** one line per user-visible action — e.g. a single
-  decoded `settings write: effect=5 brightness=4 …` when a write
-  actually changes something, connect / disconnect, upload
-  start/finish, errors. A plain read that changes nothing probably
-  should not log at `INFO` at all.
-- Expose the level in the UI (a selector on the Log tab) and/or an
-  env var, so a bug report can be captured at `DEBUG` without a
-  rebuild.
+- **Expose the level in the UI** — a selector on the Log tab that calls
+  `applog.SetLevel`, so `K724_LOG_LEVEL` isn't the only way to reach
+  `DEBUG`.

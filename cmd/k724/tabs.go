@@ -8,6 +8,7 @@ import (
 	"image/color"
 	"io"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -396,8 +397,11 @@ func (a *App) buildScreenTab() fyne.CanvasObject {
 	// Frame delay. The field on the wire is 16-bit (protocol.FrameIntervalMax),
 	// so the slider covers the common fast range and the entry takes any exact
 	// value up to the max (the Windows app's "Interval time" goes to 50000).
+	// The floor is protocol.FrameIntervalMin (50 ms): the Windows app locks its
+	// interval field to that minimum, and a test upload at 10 ms did not play
+	// any faster on the device — the firmware appears to floor it too.
 	intervalMS := 100
-	interval := widget.NewSlider(10, 2000)
+	interval := widget.NewSlider(protocol.FrameIntervalMin, 2000)
 	interval.Step = 10
 	interval.Value = 100
 	intervalEntry := widget.NewEntry()
@@ -692,8 +696,8 @@ func (a *App) buildScreenTab() fyne.CanvasObject {
 	// and retimes a running preview. syncing suppresses the echo.
 	syncingInterval := false
 	setInterval = func(v int, fromEntry bool) {
-		if v < 1 {
-			v = 1
+		if v < protocol.FrameIntervalMin {
+			v = protocol.FrameIntervalMin
 		}
 		if v > protocol.FrameIntervalMax {
 			v = protocol.FrameIntervalMax
@@ -812,13 +816,15 @@ func (a *App) buildScreenTab() fyne.CanvasObject {
 		"Each image becomes one frame. Images are centre-cropped to %d×%d and "+
 			"reduced to the screen's 16-bit colour — the preview shows exactly that. "+
 			"A GIF is split into its frames. Up to %d frames on the timeline; the "+
-			"screen loops them at the frame delay (1–%d ms). Removing a frame drops "+
-			"it into the “Removed frames” strip, where you can restore it. Upload "+
-			"needs the wired keyboard.\n\n"+
+			"screen loops them at the frame delay (%d–%d ms — the device does not "+
+			"appear to play back any faster than %d ms, so the tool won't send less). "+
+			"Removing a frame drops it into the “Removed frames” strip, where you can "+
+			"restore it. Upload needs the wired keyboard.\n\n"+
 			"The screen has no transparency. When a source has transparent pixels, "+
 			"a background-colour control appears — those pixels are filled with it "+
 			"before upload (black by default).",
-		screen.Width, screen.Height, maxFrames, protocol.FrameIntervalMax))
+		screen.Width, screen.Height, maxFrames,
+		protocol.FrameIntervalMin, protocol.FrameIntervalMax, protocol.FrameIntervalMin))
 
 	previewBar := container.NewHBox(
 		prevBtn, nextBtn, playBtn, posLabel,
@@ -861,6 +867,136 @@ func (a *App) buildScreenTab() fyne.CanvasObject {
 		explain,
 	)
 	return container.NewBorder(top, bottom, nil, nil, previewScroll)
+}
+
+// ------------------------------------------------------------------ Info tab
+
+// buildInfoTab is a read-only "about this keyboard + about this tool" panel:
+// connection identity, the firmware versions the wired open sequence reads
+// (see README.md "Firmware compatibility"), the battery/status value from
+// command 0x1A, and this build's own version. Requested by
+// docs/MISSING_FEATURES.md "Info tab".
+func (a *App) buildInfoTab() fyne.CanvasObject {
+	unset := "—"
+	connLabel := widget.NewLabel(unset)
+	productLabel := widget.NewLabel(unset)
+	idLabel := widget.NewLabel(unset)
+	pathLabel := widget.NewLabel(unset)
+	kbLabel := widget.NewLabel(unset)
+	apLabel := widget.NewLabel(unset)
+	batteryLabel := widget.NewLabel(unset)
+
+	// refresh re-reads firmware (cheap, already cached on Device from the
+	// connect-time probe) and battery (a fresh 0x1A round trip) on the
+	// worker goroutine, matching every other tab's a.dev access pattern —
+	// a.dev is touched only from inside a.do closures, never from the UI
+	// thread directly.
+	refresh := func() {
+		a.do(func() {
+			if a.dev == nil {
+				return
+			}
+			fw := a.dev.Firmware()
+			bat, batErr := a.dev.Battery()
+			ui(func() {
+				if fw.Known {
+					kbLabel.SetText(protocol.FormatVersion(fw.KBVersion))
+					apLabel.SetText(protocol.FormatVersion(fw.APVersion))
+				} else {
+					kbLabel.SetText("not reported (wireless receiver)")
+					apLabel.SetText("not reported (wireless receiver)")
+				}
+				if batErr != nil {
+					batteryLabel.SetText("unavailable: " + batErr.Error())
+				} else {
+					batteryLabel.SetText(fmt.Sprintf("%d%%", bat.Percent))
+				}
+			})
+		})
+	}
+
+	refreshBtn := widget.NewButtonWithIcon("Refresh", theme.ViewRefreshIcon(), refresh)
+
+	connected := false
+	refreshControls := func() { toggle(connected && !a.busy, refreshBtn) }
+	a.onConnState = append(a.onConnState, func(c bool, t k724.Target) {
+		connected = c
+		refreshControls()
+		if !c {
+			connLabel.SetText(unset)
+			productLabel.SetText(unset)
+			idLabel.SetText(unset)
+			pathLabel.SetText(unset)
+			kbLabel.SetText(unset)
+			apLabel.SetText(unset)
+			batteryLabel.SetText(unset)
+			return
+		}
+		connLabel.SetText(t.Label())
+		productLabel.SetText(t.Product)
+		idLabel.SetText(fmt.Sprintf("%04x:%04x", t.VID, t.PID))
+		pathLabel.SetText(t.Path)
+		refresh()
+	})
+	a.onBusy = append(a.onBusy, func(bool) { refreshControls() })
+	refreshControls()
+
+	form := container.NewVBox(
+		title("Keyboard"),
+		labelRow("Connection", connLabel),
+		labelRow("Product", productLabel),
+		labelRow("VID:PID", idLabel),
+		labelRow("HID path", pathLabel),
+		widget.NewSeparator(),
+		title("Firmware"),
+		labelRow("KB (keyboard)", kbLabel),
+		labelRow("AP (2.4 GHz receiver)", apLabel),
+		widget.NewSeparator(),
+		title("Battery"),
+		labelRow("Charge", batteryLabel),
+		wrapLabel("The battery field (command 0x1A) is a hypothesis, not a "+
+			"confirmed byte map — see docs/COMMANDS.md. It has only ever been "+
+			"observed reading 100%."),
+		refreshBtn,
+		widget.NewSeparator(),
+		title("k724-tool"),
+		labelRow("Version", widget.NewLabel(toolVersion())),
+	)
+	return container.NewVScroll(form)
+}
+
+// labelRow lays out a bold field name and its value side by side.
+func labelRow(name string, value *widget.Label) fyne.CanvasObject {
+	return container.NewBorder(nil, nil, widget.NewLabelWithStyle(name+":", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), nil, value)
+}
+
+// toolVersion reports this build's own version: the VCS revision Go embeds
+// automatically when building from a git checkout (Go 1.18+), or "dev" for
+// a `go run` build with no embedded VCS info.
+func toolVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "dev"
+	}
+	var rev, mod string
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			mod = s.Value
+		}
+	}
+	if rev == "" {
+		return "dev"
+	}
+	if len(rev) > 12 {
+		rev = rev[:12]
+	}
+	if mod == "true" {
+		rev += "-dirty"
+	}
+	return rev
 }
 
 // ------------------------------------------------------------------- Log tab

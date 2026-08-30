@@ -76,7 +76,7 @@ On Hyprland/Wayland, build with `-tags wayland` so the window gets a
 real app-id (`com.github.k724tool.k724`); otherwise it runs under
 XWayland with a generic class.
 
-One window, four tabs:
+One window, six tabs:
 
 - **Clock** — "Sync to system time", or type a specific
   `YYYY-MM-DD HH:MM:SS` and set that.
@@ -94,11 +94,18 @@ One window, four tabs:
 - **Screen** — add one or more PNG/JPEG/BMP/GIF files (a GIF expands to
   its frames). Frames sit on a horizontal timeline you can reorder;
   removing one drops it into a restorable "Removed frames" strip. Up to
-  25 frames. Frame delay goes up to 50000 ms (slider for the fast range,
-  entry for an exact value). The preview is the decoded RGB565 frame at a
-  chosen zoom with nearest-neighbour scaling, so it shows the crop and
-  16-bit colour exactly as the screen will. Upload needs the wired
-  keyboard.
+  25 frames. Frame delay runs 50–50000 ms (slider for the fast range,
+  entry for an exact value; the device does not appear to play back
+  faster than 50 ms, so the tool won't send less). The preview is the
+  decoded RGB565 frame at a chosen zoom with nearest-neighbour scaling,
+  so it shows the crop and 16-bit colour exactly as the screen will.
+  Upload needs the wired keyboard.
+- **Info** — a read-only "about this keyboard + about this tool" panel:
+  connection identity (product, VID:PID, wired/wireless, HID path), the
+  KB/AP firmware versions the mismatch banner already checks, battery
+  charge, and k724-tool's own build revision. Battery reads command
+  `0x1A`; that byte map is a hypothesis, not a confirmed field (see
+  `docs/COMMANDS.md`), and the tab says so.
 
 All of Clock / Lighting / Polling are **read-modify-write**: the tool
 reads the 49-byte settings block with command `0x05`, changes only the
@@ -135,6 +142,41 @@ installs it, or copy `packaging/70-redragon-k724.rules` to
 Build deps (developers only, not end users): a C compiler, and on Linux
 `libgl1-mesa-dev xorg-dev libudev-dev`.
 
+## Testing without hardware
+
+`internal/k724` has a built-in simulator: an in-process stand-in for the
+keyboard's vendor HID endpoint that answers `0x01`/`0x02`/`0x03`/`0x05`/
+`0x06`/`0x0b`/`0x21`/`0x23`/`0xAA` the way the documented byte offsets say
+the real firmware would. It implements the same small interface `Device`
+drives the real hidapi handle through, so probing, the settings
+read-modify-write, the per-key colour table, and the screen upload chunking
+all run through the exact same code as a real keyboard — only the transport
+underneath changes. It is not a firmware emulator (no timing quirks, no
+dropped reports, no undecoded fields modelled), which is enough to develop
+and test client-side logic without a physical unit.
+
+Set `K724_SIM=1` and both the GUI and `cmd/setclock` pick it up with no
+other changes — `Enumerate` lists a simulated wired keyboard and wireless
+receiver (`sim://wired`, `sim://wireless`) alongside anything real:
+
+```
+K724_SIM=1 go run ./cmd/k724                       # GUI against a virtual keyboard
+K724_SIM=1 go run ./cmd/setclock -path sim://wired  # CLI, wired
+```
+
+`K724_SIM_KB_VERSION` / `K724_SIM_AP_VERSION` (hex, e.g. `0100`) override the
+simulated firmware versions the `0x03` descriptor reports, to test the
+firmware-mismatch banner without a real out-of-date unit. `K724_SIM_BATTERY`
+(`0`–`100`) overrides the simulated battery percentage, defaulting to `100`.
+See `internal/k724/sim.go` and `sim_test.go`.
+
+The device layer logs through `internal/applog`, which defaults to `INFO`
+(connect/disconnect, a decoded settings write only when something besides
+the clock actually changed, upload start/finish, errors) and drops the
+per-command hex dumps and step-sequence bookkeeping to `DEBUG`. Set
+`K724_LOG_LEVEL=debug` to see everything — useful together with `K724_SIM`
+to watch the full wire-level exchange without touching hardware.
+
 ## Status
 
 - **Clock** — `cmd/setclock` and the GUI both do the read-modify-write:
@@ -153,6 +195,12 @@ Build deps (developers only, not end users): a C compiler, and on Linux
   app's `V%04x` format string and its Settings table, and
   `internal/protocol` has a golden test against the captured bytes. Confirmed
   for the read; the KB-vs-AP record assignment is a strong hypothesis.
+- **Battery** — command `0x1A` is confirmed to exist and answer
+  `64 01 00 00 00 00` (wireless) / `64 02 00 00 00 00` (wired). `0x64` = 100
+  lining up with "100%" is a hypothesis: only one capture of this reply
+  exists, and it was never taken at a level other than 100%, so the exact
+  byte-to-percent mapping is unconfirmed. The Info tab shows it with that
+  caveat.
 
 ## Known issue: `python/set_clock.py` still does a blind write
 
