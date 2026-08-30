@@ -18,15 +18,26 @@ const (
 	// MaxChunkLen is the largest chunk a single report can carry.
 	MaxChunkLen = ReportSize - HeaderSize
 
+	// DescriptorLen is the payload length of the command 0x03 descriptor read
+	// the wired open sequence uses. The reply embeds the keyboard's VID/PID
+	// (little-endian pair) and the KB / AP firmware versions at fixed offsets;
+	// see descriptor.go and docs/COMMANDS.md.
+	DescriptorLen = 37
+
 	reportMarker = 0x04
 )
 
-// Command IDs used by the device.
+// Command IDs used by the device. See docs/COMMANDS.md for the full table.
 const (
-	CmdPing       = 0xAA
-	Cmd01         = 0x01
-	CmdWriteClock = 0x06
-	CmdCommit     = 0x02
+	CmdPing       = 0xAA // ping / connection probe (wireless open sequence only)
+	Cmd01         = 0x01 // begin transaction / write batch
+	CmdCommit     = 0x02 // commit / apply a write batch
+	CmdDescriptor = 0x03 // read the device descriptor block (wired open sequence)
+	CmdReadAt     = 0x05 // read N bytes at a device offset
+	CmdWriteAt    = 0x06 // write N bytes at a device offset (the settings block)
+	CmdWriteClock = CmdWriteAt
+	CmdBeginBulk  = 0x23 // "begin bulk image transfer" marker, before the 0x21 run
+	CmdScreen     = 0x21 // TFT frame push, 24-bit device offset in bytes 5-7
 )
 
 // USB device identity. The wired keyboard and the 2.4 GHz wireless receiver
@@ -96,6 +107,31 @@ func BuildReport(cmd byte, offset uint16, chunk []byte) []byte {
 	return report
 }
 
+// BuildReportWide builds one 64-byte HID interrupt-OUT report that carries a
+// 24-bit little-endian device offset in bytes 5-7 instead of the usual 16-bit
+// offset in bytes 5-6. Only command 0x21 (the TFT frame push) uses this form;
+// see docs/SCREEN.md. The checksum formula is unchanged: byte 7 falls inside
+// the summed range, so it is covered automatically.
+func BuildReportWide(cmd byte, offset uint32, chunk []byte) []byte {
+	if len(chunk) > MaxChunkLen {
+		panic("protocol: chunk longer than MaxChunkLen")
+	}
+
+	report := make([]byte, ReportSize)
+	report[0] = reportMarker
+	report[3] = cmd
+	report[4] = byte(len(chunk))
+	report[5] = byte(offset)
+	report[6] = byte(offset >> 8)
+	report[7] = byte(offset >> 16)
+	copy(report[HeaderSize:], chunk)
+
+	sum := Checksum(report[:HeaderSize+len(chunk)])
+	report[1] = byte(sum)
+	report[2] = byte(sum >> 8)
+	return report
+}
+
 // ReplyOK reports whether reply is a valid answer to a report sent with
 // command cmd.
 func ReplyOK(reply []byte, cmd byte) bool {
@@ -135,31 +171,42 @@ func ClockPayload(t time.Time) []byte {
 }
 
 // Step is one command in a report sequence: a command ID, a device buffer
-// offset, and a data chunk.
+// offset, and a data chunk. When Wide is set the offset is framed as a 24-bit
+// value (bytes 5-7); otherwise it is the usual 16-bit offset (bytes 5-6).
 type Step struct {
 	Cmd    byte
-	Offset uint16
+	Offset uint32
 	Chunk  []byte
+	Wide   bool
 }
 
 // Report builds the 64-byte HID interrupt-OUT report for this step.
 func (s Step) Report() []byte {
-	return BuildReport(s.Cmd, s.Offset, s.Chunk)
+	if s.Wide {
+		return BuildReportWide(s.Cmd, s.Offset, s.Chunk)
+	}
+	return BuildReport(s.Cmd, uint16(s.Offset), s.Chunk)
 }
 
 // ClockSteps returns the step sequence that sets the device clock to t: a
 // ping, two 0x01 writes, three 0x06 chunks that carry the payload, and a
 // 0x02 commit. Send the steps in order and confirm each reply before the
 // next write.
+//
+// Deprecated: this blind write hard-codes the session-3 wireless template,
+// including the custom-colour bytes that force every key to white on the
+// wired keyboard (see docs/PROTOCOL.md). The safe path is a read-modify-write
+// of the settings block: SettingsReadSteps, SettingsBlock.SetTime,
+// SettingsWriteSteps. Kept only for cmd/setclock's existing behaviour.
 func ClockSteps(t time.Time) []Step {
 	payload := ClockPayload(t)
 	return []Step{
-		{CmdPing, 0, nil},
-		{Cmd01, 0, nil},
-		{Cmd01, 0, nil},
-		{CmdWriteClock, 0, payload[0:24]},
-		{CmdWriteClock, 24, payload[24:48]},
-		{CmdWriteClock, 48, payload[48:49]},
-		{CmdCommit, 0, nil},
+		{Cmd: CmdPing},
+		{Cmd: Cmd01},
+		{Cmd: Cmd01},
+		{Cmd: CmdWriteClock, Offset: 0, Chunk: payload[0:24]},
+		{Cmd: CmdWriteClock, Offset: 24, Chunk: payload[24:48]},
+		{Cmd: CmdWriteClock, Offset: 48, Chunk: payload[48:49]},
+		{Cmd: CmdCommit},
 	}
 }
