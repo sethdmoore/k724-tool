@@ -1024,6 +1024,18 @@ func (a *App) buildLogTab() fyne.CanvasObject {
 		a.setStatus("log copied to clipboard")
 	})
 
+	// K724_LOG_LEVEL sets the level a run starts at; this lets it be raised to
+	// DEBUG (full per-command hex dumps) or lowered again without a restart.
+	levelSelect := widget.NewSelect(
+		[]string{applog.LevelDebug.String(), applog.LevelInfo.String(), applog.LevelWarn.String(), applog.LevelError.String()},
+		func(s string) {
+			if lvl, ok := applog.ParseLevel(s); ok {
+				applog.SetLevel(lvl)
+			}
+		},
+	)
+	levelSelect.SetSelected(applog.GetLevel().String())
+
 	// Poll the ring buffer so entries logged from the worker goroutine show up
 	// without the user hitting Refresh. render() is a no-op when nothing changed.
 	go func() {
@@ -1037,7 +1049,7 @@ func (a *App) buildLogTab() fyne.CanvasObject {
 	render()
 
 	return container.NewBorder(
-		container.NewHBox(refreshBtn, copyBtn),
+		container.NewHBox(refreshBtn, copyBtn, widget.NewLabel("Level:"), levelSelect),
 		wrapLabel("Log file: "+applog.Path()),
 		nil, nil,
 		container.NewScroll(view),

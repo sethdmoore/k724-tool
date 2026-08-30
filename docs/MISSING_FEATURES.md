@@ -142,8 +142,8 @@ one new `INFO` "connected: …" line. Verified with a throwaway harness
 against the simulator: a clock-only sync + one real settings change
 produced 5 `INFO` lines total (vs. 18 at `DEBUG`).
 
-Still wanted:
-
-- **Expose the level in the UI** — a selector on the Log tab that calls
-  `applog.SetLevel`, so `K724_LOG_LEVEL` isn't the only way to reach
-  `DEBUG`.
+~~Still wanted: expose the level in the UI.~~ **Done.** The Log tab
+(`buildLogTab` in `cmd/k724/tabs.go`) has a `Level:` selector next to
+Refresh/Copy, seeded from `applog.GetLevel()` and calling
+`applog.SetLevel` on change, so `DEBUG` is reachable without
+`K724_LOG_LEVEL` or a restart.
