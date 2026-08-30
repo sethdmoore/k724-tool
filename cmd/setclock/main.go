@@ -1,27 +1,22 @@
 // Command setclock sets the onboard clock of a Redragon K724-RGB-PRO
 // keyboard from the local time.
 //
-// WARNING: this protocol was captured over the 2.4 GHz wireless receiver
-// only. A run against the wired keyboard is known to force every key's
-// RGB to solid white, with no onboard-control recovery (full power cycle
-// needed). Do not pass -wired until this is root-caused with a wired
-// capture. The default target is the wireless receiver.
+// It reads the 49-byte global settings block from the device (command 0x05),
+// stamps the current time into it, and writes it back (command 0x06). Every
+// other field — lighting, USB polling rate, screen config — keeps its
+// on-device value, so this is safe on the wired keyboard as well as the
+// wireless receiver.
 package main
 
 import (
-	"encoding/hex"
 	"flag"
 	"fmt"
 	"os"
 	"strconv"
 	"time"
 
-	hid "github.com/sstallion/go-hid"
-
-	"k724tool/internal/protocol"
+	"k724tool/internal/k724"
 )
-
-const readTimeout = 1 * time.Second
 
 var testTime = time.Date(2000, time.January, 1, 23, 59, 59, 0, time.Local)
 
@@ -40,79 +35,64 @@ func run(args []string) error {
 		path    string
 		wired   bool
 		list    bool
-		dryRun  bool
 		test    bool
 	)
 	fs.StringVar(&vidFlag, "vid", "", "USB vendor ID override, for example 0x320f")
 	fs.StringVar(&pidFlag, "pid", "", "USB product ID override, for example 0x511b")
 	fs.StringVar(&path, "path", "", "exact hidapi device path")
 	fs.BoolVar(&wired, "wired", false,
-		"target the wired keyboard instead of the wireless receiver. "+
-			"NOT confirmed safe -- known to force all-key RGB to solid white "+
-			"on at least one keyboard, recoverable only by a full power cycle.")
+		"target the wired keyboard (320f:511b) instead of the wireless receiver")
 	fs.BoolVar(&list, "list", false, "list candidate HID interfaces and exit")
-	fs.BoolVar(&dryRun, "dry-run", false, "print the reports without opening a device")
-	fs.BoolVar(&test, "test", false, "set an obviously fake time (2000-01-01 23:59:59) to confirm the write took effect")
+	fs.BoolVar(&test, "test", false,
+		"set an obviously fake time (2000-01-01 23:59:59) to confirm the write took effect")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	if err := k724.Init(); err != nil {
+		return err
+	}
+	defer k724.Exit()
+
+	targets, err := k724.Enumerate()
+	if err != nil {
+		return err
+	}
+
+	if list {
+		if len(targets) == 0 {
+			fmt.Println("no K724-RGB-PRO vendor interfaces found")
+		}
+		for _, t := range targets {
+			fmt.Printf("%-18s vid=0x%04x pid=0x%04x interface=%d path=%q product=%q\n",
+				t.Label(), t.VID, t.PID, t.Iface, t.Path, t.Product)
+		}
+		return nil
+	}
+
+	target, err := pickTarget(targets, wired, path, vidFlag, pidFlag)
+	if err != nil {
+		return err
+	}
+
+	dev, err := k724.Open(target)
+	if err != nil {
+		return err
+	}
+	defer dev.Close()
+
+	if w := dev.Firmware().Warning(); w != "" {
+		fmt.Fprintln(os.Stderr, "setclock:", w)
 	}
 
 	when := time.Now()
 	if test {
 		when = testTime
 	}
-
-	if list {
-		return listCandidates()
-	}
-
-	if dryRun {
-		for _, step := range protocol.ClockSteps(when) {
-			fmt.Println(hex.EncodeToString(step.Report()))
-		}
-		return nil
-	}
-
-	vid := uint16(protocol.VendorID)
-	pid := uint16(protocol.ProductIDWireless)
-	if wired {
-		fmt.Fprintln(os.Stderr,
-			"WARNING: -wired is not confirmed safe. This protocol was captured "+
-				"over the wireless receiver only, and a wired run has previously "+
-				"forced all-key RGB to solid white, recoverable only by a full "+
-				"power cycle. Proceeding in 3 seconds -- Ctrl-C to abort.")
-		time.Sleep(3 * time.Second)
-		pid = protocol.ProductIDWired
-	}
-	if vidFlag != "" {
-		v, err := parseHexUint16(vidFlag)
-		if err != nil {
-			return fmt.Errorf("--vid: %w", err)
-		}
-		vid = v
-	}
-	if pidFlag != "" {
-		p, err := parseHexUint16(pidFlag)
-		if err != nil {
-			return fmt.Errorf("--pid: %w", err)
-		}
-		pid = p
-	}
-
-	if err := hid.Init(); err != nil {
+	if err := dev.SetClock(when); err != nil {
 		return err
 	}
-	defer hid.Exit()
 
-	dev, err := openDevice(vid, pid, path)
-	if err != nil {
-		return err
-	}
-	defer dev.Close()
-
-	if err := setClock(dev, when); err != nil {
-		return err
-	}
 	msg := "clock set OK"
 	if test {
 		msg += " (test value: 2000-01-01 23:59:59)"
@@ -121,128 +101,58 @@ func run(args []string) error {
 	return nil
 }
 
+// pickTarget chooses which enumerated interface to open, applying the flag
+// overrides. A -path or -vid/-pid override synthesises a Target when nothing
+// matching was enumerated.
+func pickTarget(targets []k724.Target, wired bool, path, vidFlag, pidFlag string) (k724.Target, error) {
+	want := uint16(0x511c) // wireless receiver by default
+	if wired {
+		want = 0x511b
+	}
+	if pidFlag != "" {
+		p, err := parseHexUint16(pidFlag)
+		if err != nil {
+			return k724.Target{}, fmt.Errorf("-pid: %w", err)
+		}
+		want = p
+	}
+	vid := uint16(0x320f)
+	if vidFlag != "" {
+		v, err := parseHexUint16(vidFlag)
+		if err != nil {
+			return k724.Target{}, fmt.Errorf("-vid: %w", err)
+		}
+		vid = v
+	}
+
+	if path != "" {
+		return k724.Target{Path: path, VID: vid, PID: want, Wired: want == 0x511b}, nil
+	}
+
+	for _, t := range targets {
+		if t.VID == vid && t.PID == want {
+			return t, nil
+		}
+	}
+	if vidFlag != "" || pidFlag != "" {
+		return k724.Target{VID: vid, PID: want, Wired: want == 0x511b}, nil
+	}
+	return k724.Target{}, fmt.Errorf(
+		"no %s found (looked for %04x:%04x); try -list, or -vid/-pid/-path",
+		labelFor(want), vid, want)
+}
+
+func labelFor(pid uint16) string {
+	if pid == 0x511b {
+		return "wired keyboard"
+	}
+	return "wireless receiver"
+}
+
 func parseHexUint16(s string) (uint16, error) {
 	v, err := strconv.ParseUint(s, 0, 16)
 	if err != nil {
 		return 0, err
 	}
 	return uint16(v), nil
-}
-
-func findCandidates(vid, pid uint16) ([]*hid.DeviceInfo, error) {
-	var out []*hid.DeviceInfo
-	err := hid.Enumerate(vid, pid, func(info *hid.DeviceInfo) error {
-		if protocol.IsVendorUsagePage(info.UsagePage) {
-			out = append(out, info)
-		}
-		return nil
-	})
-	return out, err
-}
-
-func listCandidates() error {
-	if err := hid.Init(); err != nil {
-		return err
-	}
-	defer hid.Exit()
-
-	candidates, err := findCandidates(hid.VendorIDAny, hid.ProductIDAny)
-	if err != nil {
-		return err
-	}
-	for _, info := range candidates {
-		fmt.Printf(
-			"vid=0x%04x pid=0x%04x path=%q product=%q interface=%d usage_page=0x%04x\n",
-			info.VendorID, info.ProductID, info.Path, info.ProductStr,
-			info.InterfaceNbr, info.UsagePage,
-		)
-	}
-	return nil
-}
-
-// probe opens path and pings it with command 0xAA. It returns the open
-// device if the device answers the ping correctly, or (nil, nil) if the
-// device opened but did not answer. It returns a non-nil error only if
-// path could not be opened at all.
-func probe(path string) (*hid.Device, error) {
-	dev, err := hid.OpenPath(path)
-	if err != nil {
-		return nil, err
-	}
-
-	answered := func() bool {
-		report := protocol.BuildReport(protocol.CmdPing, 0, nil)
-		if _, err := dev.Write(report); err != nil {
-			return false
-		}
-		reply := make([]byte, protocol.ReportSize)
-		n, err := dev.ReadWithTimeout(reply, readTimeout)
-		if err != nil {
-			return false
-		}
-		return protocol.ReplyOK(reply[:n], protocol.CmdPing)
-	}()
-	if answered {
-		return dev, nil
-	}
-	dev.Close()
-	return nil, nil
-}
-
-func openDevice(vid, pid uint16, path string) (*hid.Device, error) {
-	if path != "" {
-		dev, err := probe(path)
-		if err != nil {
-			return nil, fmt.Errorf("open device at path %q: %w", path, err)
-		}
-		if dev == nil {
-			return nil, fmt.Errorf("device at path %q did not answer the 0xAA ping", path)
-		}
-		return dev, nil
-	}
-
-	candidates, err := findCandidates(vid, pid)
-	if err != nil {
-		return nil, err
-	}
-	for _, info := range candidates {
-		dev, err := probe(info.Path)
-		if err != nil || dev == nil {
-			continue
-		}
-		fmt.Fprintf(
-			os.Stderr, "using %q (vid=0x%04x pid=0x%04x interface=%d)\n",
-			info.ProductStr, info.VendorID, info.ProductID, info.InterfaceNbr,
-		)
-		return dev, nil
-	}
-	return nil, fmt.Errorf(
-		"no HID interface answered the 0xAA ping: pass --vid/--pid/--path explicitly, " +
-			"or list candidates with --list",
-	)
-}
-
-func sendAndConfirm(dev *hid.Device, step protocol.Step) error {
-	report := step.Report()
-	if _, err := dev.Write(report); err != nil {
-		return fmt.Errorf("write cmd 0x%02x offset %d: %w", step.Cmd, step.Offset, err)
-	}
-	reply := make([]byte, protocol.ReportSize)
-	n, err := dev.ReadWithTimeout(reply, readTimeout)
-	if err != nil {
-		return fmt.Errorf("no valid reply for cmd 0x%02x offset %d: %w", step.Cmd, step.Offset, err)
-	}
-	if !protocol.ReplyOK(reply[:n], step.Cmd) {
-		return fmt.Errorf("no valid reply for cmd 0x%02x offset %d", step.Cmd, step.Offset)
-	}
-	return nil
-}
-
-func setClock(dev *hid.Device, when time.Time) error {
-	for _, step := range protocol.ClockSteps(when) {
-		if err := sendAndConfirm(dev, step); err != nil {
-			return err
-		}
-	}
-	return nil
 }
