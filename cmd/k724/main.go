@@ -10,6 +10,8 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -21,6 +23,52 @@ import (
 	"k724tool/internal/k724"
 	"k724tool/internal/protocol"
 )
+
+// batteryPollInterval is how often the toolbar battery indicator re-reads
+// command 0x1A while a device stays connected.
+const batteryPollInterval = 5 * time.Minute
+
+// batteryBarWidth is the number of terminal-style cells in the toolbar
+// battery indicator's bar.
+const batteryBarWidth = 8
+
+// eighthBlocks are the Unicode eighth-block characters used to render a
+// partially-filled trailing cell in the battery bar (index 0 is an empty
+// cell, index 8 would be a full cell but is never used — a full cell is
+// drawn as '█' instead).
+var eighthBlocks = [8]rune{' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'}
+
+// formatBatteryBar renders percent (clamped to 0-100) as e.g. "99% [███████▉]"
+// — full-block cells plus one eighth-resolution partial trailing cell, the
+// same technique common CLI progress bars use.
+func formatBatteryBar(percent int) string {
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	// Total eighths-of-a-cell filled across the whole bar, rounded to the
+	// nearest eighth (integer arithmetic: +50 before the /100 truncation).
+	eighths := (percent*batteryBarWidth*8 + 50) / 100
+	full := eighths / 8
+	rem := eighths % 8
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d%% [", percent)
+	for i := 0; i < batteryBarWidth; i++ {
+		switch {
+		case i < full:
+			b.WriteRune('█')
+		case i == full && rem > 0:
+			b.WriteRune(eighthBlocks[rem])
+		default:
+			b.WriteRune(' ')
+		}
+	}
+	b.WriteString("]")
+	return b.String()
+}
 
 const appID = "com.github.k724tool.k724"
 
@@ -119,7 +167,41 @@ func (a *App) build() fyne.CanvasObject {
 		toggle(!busy, a.deviceSelect, refresh)
 	})
 
-	toolbar := container.NewBorder(nil, nil, widget.NewLabel("Device:"), refresh, a.deviceSelect)
+	// Toolbar battery readout: a second, independent battery reading from
+	// the Info tab's manual one. Auto-polled every batteryPollInterval plus
+	// once on every successful connect. pollBattery runs on the worker
+	// goroutine (it's only ever invoked via a.do), matching every other
+	// a.dev access in this file — never read a.dev directly from the
+	// ticker goroutine below.
+	batteryToolbarLabel := widget.NewLabelWithStyle("—", fyne.TextAlignLeading, fyne.TextStyle{Monospace: true})
+	pollBattery := func() {
+		if a.dev == nil {
+			return
+		}
+		bat, err := a.dev.Battery()
+		ui(func() {
+			if err != nil {
+				return
+			}
+			batteryToolbarLabel.SetText(formatBatteryBar(bat.Percent))
+		})
+	}
+	a.onConnState = append(a.onConnState, func(c bool, _ k724.Target) {
+		if !c {
+			batteryToolbarLabel.SetText("—")
+			return
+		}
+		a.do(pollBattery)
+	})
+	go func() {
+		t := time.NewTicker(batteryPollInterval)
+		defer t.Stop()
+		for range t.C {
+			a.do(pollBattery)
+		}
+	}()
+
+	toolbar := container.NewBorder(nil, nil, widget.NewLabel("Device:"), container.NewHBox(refresh, batteryToolbarLabel), a.deviceSelect)
 	top := container.NewVBox(toolbar, a.firmwareBanner)
 
 	tabs := container.NewAppTabs(

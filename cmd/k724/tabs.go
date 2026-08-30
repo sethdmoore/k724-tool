@@ -954,9 +954,6 @@ func (a *App) buildInfoTab() fyne.CanvasObject {
 		widget.NewSeparator(),
 		title("Battery"),
 		labelRow("Charge", batteryLabel),
-		wrapLabel("The battery field (command 0x1A) is a hypothesis, not a "+
-			"confirmed byte map — see docs/COMMANDS.md. It has only ever been "+
-			"observed reading 100%."),
 		refreshBtn,
 		widget.NewSeparator(),
 		title("k724-tool"),
