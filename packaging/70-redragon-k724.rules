@@ -1,0 +1,18 @@
+# Non-root access to the Redragon K724-RGB-PRO vendor HID interface.
+#
+# Install:
+#   sudo cp packaging/70-redragon-k724.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger
+# then unplug and replug the keyboard / receiver.
+#
+# TAG+="uaccess" grants the seat's logged-in user an ACL on the node, which
+# is the modern mechanism and needs no group membership.
+#
+# Note: on some setups (root-owned hidraw nodes, older systemd) uaccess alone
+# has not been enough in practice for this device. If `k724` still reports a
+# permission error after a replug, add your login group to the rule, e.g.
+#   ..., MODE="0660", GROUP="plugdev"
+# and add yourself to that group, or as a last resort MODE="0666".
+
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="320f", ATTRS{idProduct}=="511b", TAG+="uaccess", MODE="0660"
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="320f", ATTRS{idProduct}=="511c", TAG+="uaccess", MODE="0660"

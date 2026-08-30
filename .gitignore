@@ -4,3 +4,8 @@ __pycache__/
 *.pyc
 venv/
 .claude/
+redragon/
+/dist/
+
+# build output of `go build ./cmd/k724`
+/k724

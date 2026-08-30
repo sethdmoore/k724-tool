@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=K724-RGB-PRO
+Comment=Configure the Redragon K724-RGB-PRO keyboard: clock, lighting, polling, TFT screen
+Exec=k724
+Icon=k724
+Terminal=false
+Categories=Utility;
