@@ -42,13 +42,31 @@ as incomplete. Nothing here is a protocol finding; it is a gap register.
 Notes for the next fresh session. These are interaction changes to the
 existing Screen tab, not new protocol work.
 
-- **Scale / crop.** A GIF is very unlikely to fit the 240×135 screen at
-  its native aspect ratio, so the encoder's centre-crop will usually
-  cut off content. Add a scale/crop control with two modes:
-  - **All frames linked/locked** — one crop rectangle applied to every
-    frame (the common case for a GIF).
-  - **Individual frames** — per-frame crop rectangle, for when frames
-    were added from different sources.
+- ~~**Scale / crop.**~~ **Fixed.** `internal/screen/encode.go` gained
+  `CentreCrop` (the old unexported `centreCrop`, exported), `CropAt(b,
+  zoom, panX, panY)` (an aspect-correct sub-rectangle of `b`, sized by
+  `zoom` and positioned by `panX`/`panY` — `zoom=1, panX=panY=0.5`
+  reproduces `CentreCrop(b)` exactly), and `FrameCrop(img, matte, crop)`
+  (what `Frame` does, but scaling from an explicit rectangle instead of
+  an internally-computed centre-crop; `Frame` is now a one-line wrapper
+  around a shared `frameImpl`). All three have unit tests in
+  `encode_test.go`.
+  `cmd/k724/tabs.go`'s Screen tab adds a "Link crop across all frames"
+  checkbox plus Crop zoom / Pan X / Pan Y sliders:
+  - **linked** (the default) — one shared `(zoom, panX, panY)` triple
+    applies to every frame (the common case for a GIF).
+  - **individual** — each `frameItem` carries its own triple
+    (`crop`/`cropSet`), falling back to `CentreCrop`'s equivalent until
+    it's been touched; the sliders read/edit whichever frame is
+    currently in the preview (`previewIdx`).
+  - `reencode()` (already the one place matte changes were applied) now
+    also re-derives every frame's crop rectangle via a `cropRectFor`
+    helper, so slider/checkbox changes reuse the same
+    reencode-then-rebuildList path the matte picker already used.
+  - A fully interactive draggable/resizable crop-rectangle overlay was
+    considered but judged a materially bigger lift (a new custom widget
+    with corner-drag resize handles) for the same result; sliders were
+    the pragmatic choice.
 - ~~**Frame reordering / deletion.**~~ **Fixed.** The per-frame
   `[◀] [👁] [▶] [🗑]` button row is gone; each timeline card
   (`cmd/k724/tabs.go`, `frameCard`, a small `widget.BaseWidget` implementing
@@ -65,10 +83,22 @@ existing Screen tab, not new protocol work.
     timeline) is the drop target — no second one was built — and now stays
     visible even when empty so there's always somewhere to drop the very
     first deleted frame.
-  - The explicit 👁 button stays (unrelated to reordering/deletion); a plain
-    tap on the card body does the same via `frameCard.Tapped`.
-- **Preview pan.** In the zoomed preview image, click and drag to pan
-  around the frame (currently the preview is fixed).
+  - The explicit 👁 button is gone too — it was redundant with a plain tap
+    on the card body, which already did the same thing via
+    `frameCard.Tapped`.
+- ~~**Preview pan.**~~ **Fixed.** `cmd/k724/tabs.go` adds `previewPan`, a
+  thin `widget.BaseWidget` with no visual of its own (`CreateRenderer`
+  hands back the preview `canvas.Image` unchanged via
+  `widget.NewSimpleRenderer`, wrapped around it purely so it implements
+  `fyne.Draggable` — `canvas.Image` doesn't, and `container.Scroll` only
+  reacts to the mouse wheel and its own scrollbar widgets, confirmed
+  against `fyne.io/fyne/v2/internal/widget/scroller.go`). Its `Dragged`
+  callback (`panPreview`) applies each event's delta straight to
+  `previewScroll.Offset` via `ScrollToOffset`, clamped by hand
+  (`clampScrollOffset`, mirroring `Scroll`'s own unexported
+  `computeOffset` — `ScrollToOffset` itself doesn't clamp) so it's a
+  harmless no-op at low zoom, where the content already fits the
+  viewport.
 - ~~**Frame-delay lower bound is 50 ms.**~~ **Fixed.** Added
   `protocol.FrameIntervalMin = 50`; `SetFrameIntervalMS` now clamps to
   `FrameIntervalMin..FrameIntervalMax`, and the Screen tab's slider

@@ -366,8 +366,31 @@ func (a *App) buildPollingTab() fyne.CanvasObject {
 type frameItem struct {
 	name string
 	src  image.Image // native-size source (GIF frames already composited)
-	data []byte      // screen.Frame(src, matte); rebuilt when the matte changes
+	data []byte      // screen.FrameCrop(src, matte, crop); rebuilt when matte or crop changes
+
+	// crop is this frame's own (zoom, panX, panY) triple, only meaningful in
+	// "individual frames" mode (see cropLinked in buildScreenTab) and only
+	// once cropSet is true — an added frame starts without one, and reencode
+	// falls back to screen.CentreCrop's equivalent (zoom=1, pan centred) for
+	// it, same as before this feature existed. cropSet exists as a separate
+	// bool rather than using a zero triple as "unset" because zoom=0 would
+	// itself need clamping to 1 anyway, so it can't double as a sentinel.
+	crop    cropState
+	cropSet bool
 }
+
+// cropState is a zoom/pan triple, converted to a concrete crop rectangle via
+// screen.CropAt at reencode time. Kept as (zoom, panX, panY) rather than a
+// resolved image.Rectangle so it survives being carried across images of
+// different native sizes unchanged (e.g. restoring a frame from the trash),
+// and so the slider UI has something stable to read back.
+type cropState struct {
+	zoom, panX, panY float64
+}
+
+// defaultCrop is CentreCrop's equivalent in (zoom, panX, panY) terms: no zoom,
+// centred pan.
+var defaultCrop = cropState{zoom: 1, panX: 0.5, panY: 0.5}
 
 const maxFrames = 25
 
@@ -535,6 +558,80 @@ func moveIndex(idx, from, to int) int {
 	}
 }
 
+// previewPan is a zero-visual widget that wraps the Screen tab's zoomed
+// preview image purely to pick up fyne.Draggable events: canvas.Image is not
+// itself a widget and doesn't implement Draggable, and its parent
+// container.Scroll only reacts to the mouse wheel and its own scrollbar
+// widgets (checked against fyne.io/fyne/v2/internal/widget/scroller.go — no
+// click-drag handling there at all). CreateRenderer hands back body (the
+// preview image) unchanged via widget.NewSimpleRenderer, the same technique
+// frameCard uses to stay a thin shell around its own body.
+type previewPan struct {
+	widget.BaseWidget
+	body   fyne.CanvasObject
+	onDrag func(dx, dy float32)
+}
+
+func newPreviewPan(body fyne.CanvasObject, onDrag func(dx, dy float32)) *previewPan {
+	p := &previewPan{body: body, onDrag: onDrag}
+	p.ExtendBaseWidget(p)
+	return p
+}
+
+func (p *previewPan) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(p.body)
+}
+
+// Dragged implements fyne.Draggable.
+func (p *previewPan) Dragged(ev *fyne.DragEvent) {
+	if p.onDrag != nil {
+		p.onDrag(ev.Dragged.DX, ev.Dragged.DY)
+	}
+}
+
+// DragEnd implements fyne.Draggable. There's no gesture-total state to settle
+// here (unlike frameCard's reorder/delete decision) — each Dragged event
+// already applied its own delta directly to the scroll offset.
+func (p *previewPan) DragEnd() {}
+
+// panPreview nudges s's viewport by one drag delta, in the same direction the
+// pointer moved (a grab-and-drag feel, as if the image were being pushed
+// around under a fixed window — the opposite sign from a scrollbar drag,
+// which moves the *thumb* with the pointer and so moves the content the
+// other way). s.Content is laid out by container.NewCenter, whose MinSize
+// matches its child's (the preview image's) — see container.NewCenter and
+// widget.Scroll.scrollBy, which both key off Content.MinSize() the same way.
+//
+// s.Offset is clamped by hand (mirroring widget.Scroll's own unexported
+// computeOffset) because Scroll.ScrollToOffset, unlike the mouse-wheel path,
+// does not clamp its argument at all. At low zoom, where the content already
+// fits the viewport on an axis, the clamp pins that axis's offset to 0, so
+// dragging is a harmless no-op exactly where there's nothing to pan.
+func panPreview(s *container.Scroll, dx, dy float32) {
+	if s == nil {
+		return
+	}
+	inner := s.Content.MinSize()
+	outer := s.Size()
+	off := s.Offset
+	off.X = clampScrollOffset(off.X-dx, outer.Width, inner.Width)
+	off.Y = clampScrollOffset(off.Y-dy, outer.Height, inner.Height)
+	s.ScrollToOffset(off)
+}
+
+// clampScrollOffset keeps a scroll offset within [0, inner-outer], matching
+// widget.Scroll's own (unexported) computeOffset so hand-driven panning stays
+// consistent with wheel-driven scrolling.
+func clampScrollOffset(offset, outer, inner float32) float32 {
+	if offset+outer >= inner {
+		offset = inner - outer
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	return offset
+}
+
 func (a *App) buildScreenTab() fyne.CanvasObject {
 	var frames []frameItem
 	previewIdx := 0
@@ -548,12 +645,37 @@ func (a *App) buildScreenTab() fyne.CanvasObject {
 	var matte color.Color
 	matteSeen := false // any added source carried transparency
 
+	// Scale/crop. cropLinked true (the default, matching "the common case
+	// for a GIF") means every frame is cropped from sharedCrop; false means
+	// each frame uses its own frameItem.crop (falling back to defaultCrop
+	// until it's been individually touched). See cropRectFor below, which is
+	// the one place this policy is applied.
+	cropLinked := true
+	sharedCrop := defaultCrop
+	// refreshCropControls is set in the controls section, where the
+	// zoom/pan sliders live; updatePreview calls it (guarded, since it runs
+	// before that section during setup) so the sliders always reflect
+	// whichever frame is currently shown, the same one previewIdx tracks.
+	var refreshCropControls func()
+
 	blank := screen.Decode(nil)
 	preview := canvas.NewImageFromImage(blank)
 	preview.FillMode = canvas.ImageFillContain
 	preview.ScaleMode = canvas.ImageScalePixels // nearest-neighbour: show real pixels
 	preview.SetMinSize(fyne.NewSize(float32(screen.Width*zoom), float32(screen.Height*zoom)))
-	previewScroll := container.NewScroll(container.NewCenter(preview))
+	// previewPan is a thin fyne.Draggable wrapper with no visual of its own
+	// (see its definition below) so that click-and-drag over the preview
+	// pans previewScroll instead of doing nothing — canvas.Image alone
+	// doesn't implement Draggable, and container.Scroll only responds to
+	// the mouse wheel and its own scrollbars, not a click-drag gesture.
+	// previewScroll is declared (but not yet assigned) before previewDrag so
+	// previewDrag's closure can capture it; it's only ever read once dragging
+	// starts, well after the assignment below runs.
+	var previewScroll *container.Scroll
+	previewDrag := newPreviewPan(preview, func(dx, dy float32) {
+		panPreview(previewScroll, dx, dy)
+	})
+	previewScroll = container.NewScroll(container.NewCenter(previewDrag))
 	previewScroll.SetMinSize(fyne.NewSize(0, float32(screen.Height*3+16)))
 
 	posLabel := widget.NewLabel("no frames")
@@ -618,11 +740,33 @@ func (a *App) buildScreenTab() fyne.CanvasObject {
 			posLabel.SetText(fmt.Sprintf("frame %d / %d", previewIdx+1, len(frames)))
 		}
 		preview.Refresh()
+		// Keep the crop sliders in step with whatever frame the preview is
+		// now showing — the same frame individual-mode crop edits apply to.
+		// Guarded because updatePreview can run (via rebuildList, called
+		// below) before the controls section has assigned this.
+		if refreshCropControls != nil {
+			refreshCropControls()
+		}
+	}
+
+	// cropRectFor resolves frame i's own concrete crop rectangle from the
+	// current scale/crop policy: the shared triple when linked, or the
+	// frame's own triple once it's had one explicitly set, or
+	// defaultCrop (CentreCrop's equivalent) for a frame that hasn't.
+	cropRectFor := func(i int) image.Rectangle {
+		cs := defaultCrop
+		switch {
+		case cropLinked:
+			cs = sharedCrop
+		case frames[i].cropSet:
+			cs = frames[i].crop
+		}
+		return screen.CropAt(frames[i].src.Bounds(), cs.zoom, cs.panX, cs.panY)
 	}
 
 	reencode := func() {
 		for i := range frames {
-			frames[i].data = screen.Frame(frames[i].src, matte)
+			frames[i].data = screen.FrameCrop(frames[i].src, matte, cropRectFor(i))
 		}
 	}
 
@@ -791,6 +935,111 @@ func (a *App) buildScreenTab() fyne.CanvasObject {
 	)
 	matteRow.Hide()
 
+	// Scale/crop controls. zoom 1.0 is CentreCrop's own framing (no zoom);
+	// panX/panY only have any effect once zoom > 1 gives them room to move
+	// (see screen.CropAt's doc comment) or on a source whose aspect ratio
+	// already leaves CentreCrop some travel on one axis.
+	cropLinkChk := widget.NewCheck("Link crop across all frames", nil)
+	cropLinkChk.Checked = true // matches cropLinked's initial value above
+
+	zoomCropLabel := widget.NewLabel("Crop zoom") // distinct from the preview's display Zoom (1x-6x) below
+	zoomCrop := widget.NewSlider(1, 4)
+	zoomCrop.Step = 0.1
+	panXLabel := widget.NewLabel("Pan X")
+	panXCrop := widget.NewSlider(0, 1)
+	panXCrop.Step = 0.02
+	panYLabel := widget.NewLabel("Pan Y")
+	panYCrop := widget.NewSlider(0, 1)
+	panYCrop.Step = 0.02
+
+	// currentCrop reads whichever crop the sliders should currently show:
+	// the shared triple when linked, else the previewed frame's own triple
+	// (or defaultCrop, if that frame hasn't been individually adjusted yet).
+	currentCrop := func() cropState {
+		if cropLinked {
+			return sharedCrop
+		}
+		if len(frames) == 0 {
+			return defaultCrop
+		}
+		idx := previewIdx
+		if idx < 0 || idx >= len(frames) {
+			idx = 0
+		}
+		if frames[idx].cropSet {
+			return frames[idx].crop
+		}
+		return defaultCrop
+	}
+
+	// syncingCrop suppresses the sliders' own OnChanged while
+	// refreshCropControls is setting their values programmatically, the same
+	// pattern setInterval uses for the delay slider/entry pair below.
+	syncingCrop := false
+	refreshCropControls = func() {
+		cs := currentCrop()
+		syncingCrop = true
+		zoomCrop.SetValue(cs.zoom)
+		panXCrop.SetValue(cs.panX)
+		panYCrop.SetValue(cs.panY)
+		syncingCrop = false
+		zoomCropLabel.SetText(fmt.Sprintf("Crop zoom %.1f×", cs.zoom))
+		panXLabel.SetText(fmt.Sprintf("Pan X %.2f", cs.panX))
+		panYLabel.SetText(fmt.Sprintf("Pan Y %.2f", cs.panY))
+	}
+
+	// applyCrop writes a slider-edited crop back to wherever it belongs
+	// (sharedCrop, or the previewed frame's own triple) and re-derives every
+	// affected frame's encoded data from it — the same reencode+rebuildList
+	// pairing the matte controls above already use.
+	applyCrop := func(mutate func(cs *cropState)) {
+		cs := currentCrop()
+		mutate(&cs)
+		if cropLinked {
+			sharedCrop = cs
+		} else if len(frames) > 0 {
+			idx := previewIdx
+			if idx < 0 || idx >= len(frames) {
+				idx = 0
+			}
+			frames[idx].crop = cs
+			frames[idx].cropSet = true
+		}
+		reencode()
+		rebuildList()
+	}
+	zoomCrop.OnChanged = func(v float64) {
+		if !syncingCrop {
+			applyCrop(func(cs *cropState) { cs.zoom = v })
+		}
+	}
+	panXCrop.OnChanged = func(v float64) {
+		if !syncingCrop {
+			applyCrop(func(cs *cropState) { cs.panX = v })
+		}
+	}
+	panYCrop.OnChanged = func(v float64) {
+		if !syncingCrop {
+			applyCrop(func(cs *cropState) { cs.panY = v })
+		}
+	}
+	cropLinkChk.OnChanged = func(linked bool) {
+		cropLinked = linked
+		// Switching to individual mode does not touch any frame's own
+		// crop — it just starts controlling/displaying whichever frame is
+		// previewed instead of the shared one, per cropRectFor's policy.
+		reencode()
+		rebuildList()
+	}
+
+	cropRow1 := container.NewHBox(cropLinkChk)
+	cropRow2 := container.NewHBox(
+		zoomCropLabel, container.NewGridWrap(fyne.NewSize(160, zoomCrop.MinSize().Height), zoomCrop),
+		panXLabel, container.NewGridWrap(fyne.NewSize(120, panXCrop.MinSize().Height), panXCrop),
+		panYLabel, container.NewGridWrap(fyne.NewSize(120, panYCrop.MinSize().Height), panYCrop),
+	)
+	cropControls := container.NewVBox(cropRow1, cropRow2)
+
 	addBtn := widget.NewButtonWithIcon("Add image…", theme.ContentAddIcon(), func() {
 		fd := dialog.NewFileOpen(func(rc fyne.URIReadCloser, err error) {
 			if err != nil || rc == nil {
@@ -817,7 +1066,12 @@ func (a *App) buildScreenTab() fyne.CanvasObject {
 				if len(srcs) > 1 {
 					name = fmt.Sprintf("%s [%d]", base, k+1)
 				}
-				frames = append(frames, frameItem{name: name, src: s, data: screen.Frame(s, matte)})
+				// data is filled in by reencode() below (crop starts unset,
+				// so cropRectFor falls back to defaultCrop for it, or to
+				// sharedCrop if linked — either way it needs frames[i].src
+				// bounds, so it can't be precomputed here without duplicating
+				// cropRectFor's policy).
+				frames = append(frames, frameItem{name: name, src: s})
 				added++
 			}
 			if transparent && !matteSeen {
@@ -828,6 +1082,7 @@ func (a *App) buildScreenTab() fyne.CanvasObject {
 				dialog.ShowInformation("Frame limit",
 					fmt.Sprintf("Added %d of %d frames; the screen holds %d.", added, len(srcs), maxFrames), a.win)
 			}
+			reencode()
 			rebuildList()
 		}, a.win)
 		fd.SetFilter(storage.NewExtensionFileFilter([]string{".png", ".jpg", ".jpeg", ".bmp", ".gif"}))
@@ -1028,13 +1283,18 @@ func (a *App) buildScreenTab() fyne.CanvasObject {
 	// --- layout ------------------------------------------------------
 
 	explain := wrapLabel(fmt.Sprintf(
-		"Each image becomes one frame. Images are centre-cropped to %d×%d and "+
+		"Each image becomes one frame, centre-cropped to %d×%d by default and "+
 			"reduced to the screen's 16-bit colour — the preview shows exactly that. "+
+			"Use the Zoom/Pan X/Pan Y sliders to crop somewhere other than centred; "+
+			"“Link crop across all frames” applies one crop to the whole timeline "+
+			"(the common case for a GIF) — turn it off to crop each frame on its "+
+			"own, picked up from whichever frame is currently previewed. "+
 			"A GIF is split into its frames. Up to %d frames on the timeline; the "+
 			"screen loops them at the frame delay (%d–%d ms — the device does not "+
 			"appear to play back any faster than %d ms, so the tool won't send less). "+
 			"Drag a frame left or right to reorder it, or drag it onto the “Removed "+
 			"frames” strip below the timeline to remove it — restore it from there. "+
+			"At higher zoom, click and drag the preview to pan around it. "+
 			"Upload needs the wired keyboard.\n\n"+
 			"The screen has no transparency. When a source has transparent pixels, "+
 			"a background-colour control appears — those pixels are filled with it "+
@@ -1108,6 +1368,7 @@ func (a *App) buildScreenTab() fyne.CanvasObject {
 		title("TFT screen"),
 		container.NewHBox(addBtn, clearBtn, layout.NewSpacer(), countLabel),
 		matteRow,
+		cropControls,
 		listScroll,
 		trashArea,
 		previewBar,

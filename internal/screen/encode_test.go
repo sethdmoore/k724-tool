@@ -170,6 +170,123 @@ func TestFrameMattesTransparentPixels(t *testing.T) {
 	}
 }
 
+// CropAt(b, 1, 0.5, 0.5) must reproduce CentreCrop(b) exactly, not just
+// approximately, for both a wide (landscape) and a tall (portrait) source, as
+// well as a source that already matches the target aspect ratio.
+func TestCropAtZoomOneMatchesCentreCrop(t *testing.T) {
+	cases := []image.Rectangle{
+		image.Rect(0, 0, 1000, 400), // much wider than 240:135 -> trims sides
+		image.Rect(0, 0, 300, 900),  // much taller -> trims top/bottom
+		image.Rect(0, 0, 481, 271),  // odd dimensions, still wide
+		image.Rect(0, 0, Width, Height),
+	}
+	for _, b := range cases {
+		want := CentreCrop(b)
+		got := CropAt(b, 1, 0.5, 0.5)
+		if got != want {
+			t.Errorf("CropAt(%v, 1, 0.5, 0.5) = %v, want CentreCrop = %v", b, got, want)
+		}
+	}
+}
+
+// Zooming in should shrink the crop rectangle (roughly by the zoom factor)
+// while keeping it centred, and panning to the extremes should flush the
+// rectangle against b's edges rather than overshoot them.
+func TestCropAtZoomAndPan(t *testing.T) {
+	b := image.Rect(0, 0, 2400, 1350) // exactly 240:135, so CentreCrop(b) == b
+
+	centred := CropAt(b, 2, 0.5, 0.5)
+	if centred.Dx() != 1200 || centred.Dy() != 675 {
+		t.Fatalf("zoom=2 centred size = %dx%d, want 1200x675", centred.Dx(), centred.Dy())
+	}
+	wantMin := image.Pt((b.Dx()-centred.Dx())/2, (b.Dy()-centred.Dy())/2)
+	if centred.Min != wantMin {
+		t.Errorf("zoom=2 centred origin = %v, want %v", centred.Min, wantMin)
+	}
+
+	topLeft := CropAt(b, 2, 0, 0)
+	if topLeft.Min != b.Min {
+		t.Errorf("panX=panY=0 origin = %v, want flush with b.Min = %v", topLeft.Min, b.Min)
+	}
+
+	bottomRight := CropAt(b, 2, 1, 1)
+	wantMax := b.Max
+	if bottomRight.Max != wantMax {
+		t.Errorf("panX=panY=1 max = %v, want flush with b.Max = %v", bottomRight.Max, wantMax)
+	}
+
+	// A landscape source has no vertical travel at zoom=1 (CentreCrop already
+	// spans the full height), but zooming in must free some up.
+	wide := image.Rect(0, 0, 4000, 1000)
+	if trav := CropAt(wide, 1, 0.5, 0).Min.Y - CropAt(wide, 1, 0.5, 1).Min.Y; trav != 0 {
+		t.Errorf("zoom=1 vertical travel on a landscape source = %d, want 0", trav)
+	}
+	zoomedTop := CropAt(wide, 2, 0.5, 0)
+	zoomedBottom := CropAt(wide, 2, 0.5, 1)
+	if zoomedTop.Min.Y >= zoomedBottom.Min.Y {
+		t.Errorf("zoom=2 vertical travel on a landscape source did not open up: top=%v bottom=%v",
+			zoomedTop, zoomedBottom)
+	}
+}
+
+// Out-of-range zoom/pan must clamp rather than produce a nonsensical or
+// out-of-bounds rectangle.
+func TestCropAtClamps(t *testing.T) {
+	b := image.Rect(0, 0, 2400, 1350)
+
+	if got, want := CropAt(b, 0.1, 0.5, 0.5), CropAt(b, 1, 0.5, 0.5); got != want {
+		t.Errorf("zoom below 1 not clamped to 1: got %v, want %v", got, want)
+	}
+	if got, want := CropAt(b, 100, 0.5, 0.5), CropAt(b, 4, 0.5, 0.5); got != want {
+		t.Errorf("zoom above 4 not clamped to 4: got %v, want %v", got, want)
+	}
+	if got, want := CropAt(b, 2, -1, -1), CropAt(b, 2, 0, 0); got != want {
+		t.Errorf("negative pan not clamped to 0: got %v, want %v", got, want)
+	}
+	if got, want := CropAt(b, 2, 2, 2), CropAt(b, 2, 1, 1); got != want {
+		t.Errorf("pan above 1 not clamped to 1: got %v, want %v", got, want)
+	}
+
+	// Whatever the inputs, the result must stay within b.
+	for _, r := range []image.Rectangle{
+		CropAt(b, 0.1, -5, -5),
+		CropAt(b, 400, 5, 5),
+	} {
+		if !r.In(b) {
+			t.Errorf("CropAt result %v escaped source bounds %v", r, b)
+		}
+	}
+}
+
+// FrameCrop with an explicit crop equal to CentreCrop must match Frame
+// byte-for-byte, and with a crop of just the left half of a red/blue-split
+// image must produce a solid-red frame.
+func TestFrameCropMatchesFrameAndHonoursExplicitRect(t *testing.T) {
+	src := image.NewNRGBA(image.Rect(0, 0, Width, Height))
+	for y := 0; y < Height; y++ {
+		for x := 0; x < Width; x++ {
+			if x < Width/2 {
+				src.SetNRGBA(x, y, color.NRGBA{R: 0xff, A: 0xff})
+			} else {
+				src.SetNRGBA(x, y, color.NRGBA{B: 0xff, A: 0xff})
+			}
+		}
+	}
+
+	if got, want := FrameCrop(src, nil, CentreCrop(src.Bounds())), Frame(src, nil); !bytes.Equal(got, want) {
+		t.Errorf("FrameCrop(CentreCrop(b)) != Frame: first diff at %d", firstDiff(got, want))
+	}
+
+	leftHalf := FrameCrop(src, nil, image.Rect(0, 0, Width/2, Height))
+	px := func(f []byte, x, y int) uint16 {
+		o := (y*Width + x) * 2
+		return uint16(f[o])<<8 | uint16(f[o+1])
+	}
+	if got := px(leftHalf, Width-1, Height/2); got != 0xF800 {
+		t.Errorf("crop of the all-red left half, sampled at the right edge = %04x, want f800 (red)", got)
+	}
+}
+
 func TestFramesReportsPNGTransparency(t *testing.T) {
 	img := image.NewNRGBA(image.Rect(0, 0, 20, 20))
 	img.SetNRGBA(0, 0, color.NRGBA{R: 0xff, G: 0xff, B: 0xff, A: 0x80}) // half-alpha

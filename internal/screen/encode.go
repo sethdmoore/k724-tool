@@ -38,6 +38,25 @@ const (
 // rather than silently becoming black. A nil matte means opaque black, which
 // reproduces the old behaviour byte-for-byte. Fully opaque images ignore matte.
 func Frame(img image.Image, matte color.Color) []byte {
+	return frameImpl(img, matte, CentreCrop(img.Bounds()))
+}
+
+// FrameCrop is Frame with the source rectangle chosen explicitly instead of
+// an internally-computed centre-crop, for callers (the Screen tab's scale/crop
+// UI) that let the user pick where in the source image the 240x135 window
+// sits. crop need not be Width:Height aspect-correct — as with Frame's
+// centre-crop, whatever rectangle is given is simply scaled to fill the frame,
+// so a mismatched aspect ratio will stretch the image. CropAt is the intended
+// way to derive an aspect-correct crop from a zoom/pan pair.
+func FrameCrop(img image.Image, matte color.Color, crop image.Rectangle) []byte {
+	return frameImpl(img, matte, crop)
+}
+
+// frameImpl holds the body shared by Frame and FrameCrop: composite over
+// matte if needed, scale from crop into a Width x Height canvas, then pack to
+// big-endian RGB565. The only difference between the two exported entry
+// points is how crop is chosen.
+func frameImpl(img image.Image, matte color.Color, crop image.Rectangle) []byte {
 	dst := image.NewRGBA(image.Rect(0, 0, Width, Height))
 
 	op := xdraw.Src
@@ -47,7 +66,7 @@ func Frame(img image.Image, matte color.Color) []byte {
 		xdraw.Draw(dst, dst.Bounds(), image.NewUniform(matteOr(matte)), image.Point{}, xdraw.Src)
 		op = xdraw.Over
 	}
-	xdraw.CatmullRom.Scale(dst, dst.Bounds(), img, centreCrop(img.Bounds()), op, nil)
+	xdraw.CatmullRom.Scale(dst, dst.Bounds(), img, crop, op, nil)
 
 	out := make([]byte, FrameBytes)
 	o := 0
@@ -111,9 +130,11 @@ func matteOr(c color.Color) color.Color {
 	return c
 }
 
-// centreCrop returns the largest sub-rectangle of b that has the Width:Height
-// aspect ratio, centred within b.
-func centreCrop(b image.Rectangle) image.Rectangle {
+// CentreCrop returns the largest sub-rectangle of b that has the Width:Height
+// aspect ratio, centred within b. It is what Frame uses when the caller has
+// not chosen a crop of their own, and it is also CropAt's zoom=1,
+// panX=panY=0.5 case (see CropAt's doc comment).
+func CentreCrop(b image.Rectangle) image.Rectangle {
 	w, h := b.Dx(), b.Dy()
 	if w <= 0 || h <= 0 {
 		return b
@@ -131,6 +152,71 @@ func centreCrop(b image.Rectangle) image.Rectangle {
 		return image.Rect(b.Min.X, y0, b.Max.X, y0+nh)
 	default:
 		return b
+	}
+}
+
+// CropAt returns an aspect-correct (Width:Height) sub-rectangle of b, sized by
+// zoom and positioned within its remaining travel by panX, panY.
+//
+//   - zoom is clamped to [1.0, 4.0]. 1.0 gives the largest aspect-correct rect
+//     within b — i.e. exactly CentreCrop(b) — and higher values shrink it
+//     (zoom in), which is what creates room to pan along whichever axis
+//     CentreCrop left fully spanned (e.g. a landscape source has no vertical
+//     travel at zoom=1, since CentreCrop already uses the full height; zooming
+//     in frees up vertical travel too).
+//   - panX, panY are clamped to [0, 1] and each place the crop rectangle
+//     within its available travel on that axis: 0 is flush with b's min edge,
+//     1 is flush with its max edge, 0.5 centres it (CentreCrop's behaviour).
+//
+// The zoom=1, panX=panY=0.5 case is computed the same way, with the same
+// integer truncation, as CentreCrop's own centring math, so CropAt(b, 1, 0.5,
+// 0.5) reproduces CentreCrop(b) exactly rather than merely approximately.
+func CropAt(b image.Rectangle, zoom, panX, panY float64) image.Rectangle {
+	w, h := b.Dx(), b.Dy()
+	if w <= 0 || h <= 0 {
+		return b
+	}
+	switch {
+	case zoom < 1:
+		zoom = 1
+	case zoom > 4:
+		zoom = 4
+	}
+	panX, panY = clamp01(panX), clamp01(panY)
+
+	base := CentreCrop(b)
+	// Dividing both dimensions of the (already aspect-correct) base rect by
+	// the same zoom factor keeps the result aspect-correct.
+	nw := int(float64(base.Dx()) / zoom)
+	nh := int(float64(base.Dy()) / zoom)
+	if nw < 1 {
+		nw = 1
+	}
+	if nh < 1 {
+		nh = 1
+	}
+
+	// travelX/Y is how far the (nw x nh) rect can slide within b on each
+	// axis. At zoom=1, nw/nh equal base's size, so travel matches whichever
+	// axis CentreCrop already trimmed (0 on the other). panX/panY of exactly
+	// 0.5 with an integer-valued 0.5*travel reproduces CentreCrop's own
+	// (w-nw)/2 floor-division centring: 0.5 is exact in float64, so the
+	// multiply introduces no rounding error, and int() truncates a
+	// non-negative value the same way integer division does.
+	travelX, travelY := w-nw, h-nh
+	x0 := b.Min.X + int(panX*float64(travelX))
+	y0 := b.Min.Y + int(panY*float64(travelY))
+	return image.Rect(x0, y0, x0+nw, y0+nh)
+}
+
+func clamp01(v float64) float64 {
+	switch {
+	case v < 0:
+		return 0
+	case v > 1:
+		return 1
+	default:
+		return v
 	}
 }
 
