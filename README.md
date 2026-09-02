@@ -8,6 +8,25 @@ Device identity (confirmed with `lsusb`):
 - wired keyboard: `320f:511b`
 - 2.4 GHz wireless receiver: `320f:511c`
 
+## Wired vs wireless
+
+Both endpoints speak the same 64-byte report protocol, but the **wired
+keyboard is the better-understood target**. Almost everything in `docs/`
+was reverse-engineered from wired captures — the 49-byte settings-block
+byte map, the screen-upload sequence, the `0x03` descriptor/firmware
+block, and the per-key colour table all come from wired `.pcapng`s
+(mostly the session-4 set). There is exactly **one** wireless capture
+(session 3), and it is also the one whose stale `0xCCCCCC` colour bytes
+are the "all keys white" hazard described under "Known issue" below.
+
+The read-modify-write clients (`cmd/setclock` and the GUI) are safe on
+**either** endpoint: they read the live settings block first and change
+only the field you asked for, so nothing gets blind-written. The one
+thing that is still wired-specific is the connection probe — the wired
+keyboard must never be sent the `0xAA` ping (see "Connection probe"
+under GUI). `cmd/setclock` still defaults to the wireless receiver for
+historical reasons; pass `-wired` when the keyboard is on USB.
+
 ## Firmware compatibility
 
 Everything here was reverse-engineered from one keyboard on one firmware
@@ -43,7 +62,10 @@ never version-checked.
   rate, and TFT-screen image/animation upload in one window. See
   "GUI" below.
 - `cmd/setclock/` — a Go CLI that just sets the clock (read-modify-write,
-  wired-safe). `setclock -list`, `setclock`, `setclock -wired`.
+  safe on either endpoint). `setclock -list`, `setclock`, `setclock -wired`.
+  No flags targets the wireless receiver; `-wired` targets the keyboard,
+  which is the path with more capture data behind it (see "Wired vs
+  wireless" above).
 - `python/set_clock.py` — the original `hidapi` client. Still does a
   blind write — see the note below.
 - `internal/protocol/` — the pure wire-protocol code: report framing,
@@ -146,8 +168,8 @@ Build deps (developers only, not end users): a C compiler, and on Linux
 
 `internal/k724` has a built-in simulator: an in-process stand-in for the
 keyboard's vendor HID endpoint that answers `0x01`/`0x02`/`0x03`/`0x05`/
-`0x06`/`0x0b`/`0x21`/`0x23`/`0xAA` the way the documented byte offsets say
-the real firmware would. It implements the same small interface `Device`
+`0x06`/`0x0b`/`0x1A`/`0x21`/`0x23`/`0xAA` the way the documented byte
+offsets say the real firmware would. It implements the same small interface `Device`
 drives the real hidapi handle through, so probing, the settings
 read-modify-write, the per-key colour table, and the screen upload chunking
 all run through the exact same code as a real keyboard — only the transport
@@ -181,15 +203,17 @@ to watch the full wire-level exchange without touching hardware.
 
 - **Clock** — `cmd/setclock` and the GUI both do the read-modify-write:
   read the block with `0x05`, stamp the time, write back with `0x06`.
-  The clock write itself is confirmed on real hardware (over the
-  wireless receiver); the byte map that makes the RMW safe on wired is
-  confirmed against four wired captures.
+  The settings-block byte map that makes the RMW safe is confirmed
+  against four wired captures. The one live end-to-end clock round-trip
+  in a capture was over the wireless receiver (session 3), before the
+  RMW clients existed — that same capture is where the dangerous
+  `0xCCCCCC` colour bytes came from.
 - **Lighting / polling** — the settings-block fields are confirmed on
   the wire (`docs/PROTOCOL.md`); the GUI writes them via read-modify-
   write. Not yet round-tripped against hardware through the GUI.
 - **Screen** — the upload sequence and RGB565 format are confirmed
-  byte-for-byte against a wired capture (`docs/SCREEN.md`); the encoder
-  has a golden test against those exact device bytes.
+  byte-for-byte against the wired screen captures (`docs/SCREEN.md`);
+  the encoder has a golden test against those exact device bytes.
 - **Firmware check** — the `0x03` reply is identical across all five wired
   captures; the KB/AP version offsets are cross-checked against the Windows
   app's `V%04x` format string and its Settings table, and
@@ -204,10 +228,11 @@ to watch the full wire-level exchange without touching hardware.
 
 ## Known issue: `python/set_clock.py` still does a blind write
 
-The Python script sends the clock as a fixed 49-byte payload captured
-over the wireless receiver. That payload's bytes 6–8 are a custom
-**RGB colour** of `0xCCCCCC`; the wired firmware applies it and forces
-every key to near-white (recoverable only by a power cycle). Use
-`cmd/setclock` or the GUI, which read the current block first and change
-only the timestamp. If you must use the Python script, keep it on the
-wireless receiver.
+This is the one place the wired/wireless split still matters. The Python
+script sends the clock as a fixed 49-byte payload captured over the
+wireless receiver. That payload's bytes 6–8 are a custom **RGB colour**
+of `0xCCCCCC`; the wired firmware applies it and forces every key to
+near-white (recoverable only by a power cycle). The Go clients
+(`cmd/setclock`, the GUI) don't have this problem on either endpoint —
+they read the current block first and change only the timestamp. If you
+must use the Python script, keep it on the wireless receiver.
